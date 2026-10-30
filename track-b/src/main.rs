@@ -49,21 +49,86 @@ impl Hasher for Fx {
 }
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
 
-/// Calls `f` with every token of `text`: maximal runs of [a-z0-9] after ASCII-lowercasing.
-/// Tokens are lowercased into `buf`, so the slice passed to `f` is only valid during the call.
-fn tokens(text: &[u8], buf: &mut Vec<u8>, mut f: impl FnMut(&[u8])) {
-    for &b in text {
-        let c = b.to_ascii_lowercase();
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            buf.push(c);
-        } else if !buf.is_empty() {
-            f(buf);
-            buf.clear();
+/// Maps each byte to its lowercased form if it can be part of a token ([A-Za-z0-9]), else to 0.
+static TOKEN_BYTE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        if (i as u8).is_ascii_alphanumeric() {
+            table[i] = (i as u8).to_ascii_lowercase();
+        }
+        i += 1;
+    }
+    table
+};
+
+fn step_hash(h: u64, c: u8) -> u64 {
+    (h.rotate_left(5) ^ c as u64).wrapping_mul(0x517cc1b727220a95)
+}
+
+/// Calls `f(token, hash)` for every token of `text`: maximal runs of [a-z0-9] after ASCII
+/// lowercasing (every byte >= 0x80 is a separator). The hash is computed while scanning. A token
+/// longer than 32 bytes cannot be a query term and is passed as empty.
+fn tokens(text: &[u8], mut f: impl FnMut(&[u8], u64)) {
+    let (mut buf, mut len, mut h) = ([0u8; 32], 0usize, 0u64);
+    for &b in text.iter().chain(std::iter::once(&b' ')) {
+        let c = TOKEN_BYTE[b as usize];
+        if c != 0 {
+            if len < 32 {
+                buf[len] = c;
+            }
+            len += 1;
+            h = step_hash(h, c);
+        } else if len > 0 {
+            f(if len <= 32 { &buf[..len] } else { &[] }, h);
+            (len, h) = (0, 0);
         }
     }
-    if !buf.is_empty() {
-        f(buf);
-        buf.clear();
+}
+
+/// The query terms in an open-addressing table keyed by the tokenizer's own hash, so a lookup costs
+/// one probe sequence and one byte comparison.
+struct Vocab {
+    slots: Vec<u32>,
+    words: Vec<&'static [u8]>,
+    shift: u32,
+}
+
+impl Vocab {
+    /// `words[id]` is the term with that id.
+    fn new(words: Vec<&'static [u8]>) -> Vocab {
+        let bits = (words.len() * 2)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(1);
+        let mut vocab = Vocab {
+            slots: vec![u32::MAX; 1 << bits],
+            words,
+            shift: 64 - bits,
+        };
+        for id in 0..vocab.words.len() {
+            let h = vocab.words[id].iter().fold(0, |h, &c| step_hash(h, c));
+            let mut i = (h >> vocab.shift) as usize;
+            while vocab.slots[i] != u32::MAX {
+                i = (i + 1) & (vocab.slots.len() - 1);
+            }
+            vocab.slots[i] = id as u32;
+        }
+        vocab
+    }
+
+    fn get(&self, token: &[u8], h: u64) -> Option<u32> {
+        let mut i = (h >> self.shift) as usize;
+        loop {
+            let id = self.slots[i];
+            if id == u32::MAX {
+                return None;
+            }
+            if self.words[id as usize] == token {
+                return Some(id);
+            }
+            i = (i + 1) & (self.slots.len() - 1);
+        }
     }
 }
 
@@ -300,6 +365,11 @@ fn main() {
         }
     }
     let term_count = terms.len();
+    let mut words = vec![&b""[..]; term_count];
+    for (&word, &id) in &terms {
+        words[id as usize] = word;
+    }
+    let vocab = Vocab::new(words);
     let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
     let states = automaton.fail.len();
 
@@ -315,7 +385,6 @@ fn main() {
                         let mut done = Vec::new();
                         let mut last_doc = vec![u32::MAX; term_count];
                         let mut last_match = vec![u32::MAX; states];
-                        let mut buf = Vec::new();
                         loop {
                             let c = next.fetch_add(1, Ordering::Relaxed);
                             let Some(chunk) = chunks.get(c) else { break };
@@ -331,8 +400,8 @@ fn main() {
                                     .iter()
                                     .fold(0u32, |acc, &b| acc * 10 + (b - b'0') as u32);
                                 let mut state = 0;
-                                tokens(&chunk[tab + 1..end], &mut buf, |token| {
-                                    let Some(&t) = terms.get(token) else {
+                                tokens(&chunk[tab + 1..end], |token, h| {
+                                    let Some(t) = vocab.get(token, h) else {
                                         state = 0; // no phrase contains a word that is not a query term
                                         return;
                                     };
