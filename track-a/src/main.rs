@@ -8,8 +8,6 @@
 //!    them, so every group is one contiguous run per chunk. No other per-line array is allocated.
 //! 4. Groups are formatted in parallel ranges: a group's runs are gathered from every chunk into a
 //!    small scratch buffer and the nearest-rank percentiles come from `select_nth_unstable`.
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 
 unsafe extern "C" {
@@ -30,20 +28,59 @@ fn map_file(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
-/// FxHash: one rotate, xor and multiply per 8 bytes. Endpoints are short, so this beats SipHash.
-#[derive(Default)]
-struct Fx(u64);
-impl Hasher for Fx {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.0 =
-                (self.0.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517cc1b727220a95);
+/// FxHash-style hash of a byte string: one rotate, xor and multiply per 8 bytes.
+fn hash(bytes: &[u8]) -> u64 {
+    bytes.chunks(8).fold(bytes.len() as u64, |h, chunk| {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        (h.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517cc1b727220a95)
+    })
+}
+
+/// Index of the first space at or after `i`, testing 8 bytes at a time where 8 bytes remain.
+fn find_space(s: &[u8], mut i: usize) -> usize {
+    while let Some(word) = s.get(i..i + 8) {
+        let w = u64::from_le_bytes(word.try_into().unwrap()) ^ 0x2020_2020_2020_2020;
+        let zero = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
+        if zero != 0 {
+            return i + zero.trailing_zeros() as usize / 8; // the lowest zero byte is exact
         }
+        i += 8;
     }
-    fn finish(&self) -> u64 {
-        self.0
+    i + s[i..].iter().position(|&b| b == b' ').unwrap()
+}
+
+/// A thread's endpoint -> local id table: open addressing, comparing the stored hash before bytes.
+struct Endpoints {
+    slots: Vec<u32>, // 0 = empty, otherwise local id + 1
+    names: Vec<(&'static [u8], u64)>,
+}
+
+impl Endpoints {
+    fn id(&mut self, name: &'static [u8]) -> u16 {
+        let h = hash(name);
+        let mask = self.slots.len() - 1;
+        let mut i = (h >> 40) as usize & mask;
+        while self.slots[i] != 0 {
+            let (known, known_hash) = self.names[self.slots[i] as usize - 1];
+            if known_hash == h && known == name {
+                return self.slots[i] as u16 - 1;
+            }
+            i = (i + 1) & mask;
+        }
+        self.names.push((name, h));
+        self.slots[i] = self.names.len() as u32;
+        if self.names.len() * 2 > self.slots.len() {
+            let mut bigger = Endpoints {
+                slots: vec![0; self.slots.len() * 2],
+                names: Vec::new(),
+            };
+            for &(n, _) in &self.names {
+                bigger.id(n);
+            }
+            *self = bigger;
+        }
+        u16::try_from(self.names.len() - 1).expect("more than 65536 endpoints in one chunk")
     }
 }
 
@@ -87,17 +124,22 @@ fn hour_of(ts: &[u8]) -> i64 {
 const HOUR_BIAS: i64 = 1 << 14;
 
 struct Shard {
-    endpoints: Vec<&'static [u8]>,
+    endpoints: Endpoints,
     records: Vec<u64>,
+    /// Smallest and largest biased hour seen.
+    hours: (u64, u64),
 }
 
 fn parse(chunk: &'static [u8], base_hour: i64) -> Shard {
     // Lines are 40 to 160 bytes and about 77 on average; grow only if this guess is low.
     let mut shard = Shard {
-        endpoints: Vec::new(),
+        endpoints: Endpoints {
+            slots: vec![0; 4096],
+            names: Vec::new(),
+        },
         records: Vec::with_capacity(chunk.len() / 70),
+        hours: (u64::MAX, 0),
     };
-    let mut ids: HashMap<&[u8], u16, BuildHasherDefault<Fx>> = HashMap::default();
     let (mut p, mut last_prefix, mut hour_bits) = (0, &chunk[..0], 0u64);
     while p < chunk.len() {
         let line = &chunk[p..];
@@ -109,22 +151,13 @@ fn parse(chunk: &'static [u8], base_hour: i64) -> Shard {
                 "timestamps span more than 1.8 years"
             );
             hour_bits = (rel as u64) << 49;
+            shard.hours = (shard.hours.0.min(rel as u64), shard.hours.1.max(rel as u64));
         }
         // The timestamp is 27 bytes, then a space and a method of 3 to 7 bytes.
-        let mut i = 31;
-        while line[i] != b' ' {
-            i += 1;
-        }
-        let mut j = i + 1;
-        while line[j] != b' ' {
-            j += 1;
-        }
+        let i = find_space(line, 31);
+        let j = find_space(line, i + 1);
         let endpoint = &line[i + 1..j];
-        let next_id = shard.endpoints.len();
-        let id = *ids.entry(endpoint).or_insert_with(|| {
-            shard.endpoints.push(endpoint);
-            u16::try_from(next_id).expect("more than 65536 endpoints in one chunk")
-        });
+        let id = shard.endpoints.id(endpoint);
         let error = (line[j + 1] == b'5') as u64;
         let mut k = j + 5;
         let mut latency = 0u64;
@@ -197,16 +230,12 @@ fn main() {
     // Phase 2: one sorted endpoint list (byte order), the hour range, and dense group ids.
     let mut names: Vec<&[u8]> = shards
         .iter()
-        .flat_map(|s| s.endpoints.iter().copied())
+        .flat_map(|s| s.endpoints.names.iter().map(|e| e.0))
         .collect();
     names.sort_unstable();
     names.dedup();
-    let (lo, hi) = shards
-        .iter()
-        .flat_map(|s| s.records.iter())
-        .fold((u64::MAX, 0), |(lo, hi), r| {
-            (lo.min(r >> 49), hi.max(r >> 49))
-        });
+    let lo = shards.iter().map(|s| s.hours.0).min().unwrap();
+    let hi = shards.iter().map(|s| s.hours.1).max().unwrap();
     let groups = (hi - lo + 1) as usize * names.len();
     assert!(groups < 1 << 31, "too many (hour, endpoint) groups");
 
@@ -217,8 +246,9 @@ fn main() {
             scope.spawn(move || {
                 let ranks: Vec<u64> = shard
                     .endpoints
+                    .names
                     .iter()
-                    .map(|e| names.binary_search(e).unwrap() as u64)
+                    .map(|e| names.binary_search(&e.0).unwrap() as u64)
                     .collect();
                 for r in shard.records.iter_mut() {
                     let group =
