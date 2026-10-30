@@ -139,42 +139,45 @@ impl RadixHeap {
     }
 }
 
-/// Shortest distance from `s` to `t`, or None if `t` is not reachable. `dist` is all-MAX on entry
-/// and on return; only the entries a search touched are reset.
-fn shortest(
+/// Shortest distance from `s` to `t`: Ok(None) if `t` is unreachable, Err(()) if a distance did not
+/// fit in `T`. `dist[v]` holds v's tentative distance + 1, so 0 means "not reached": the arrays can
+/// come zeroed from calloc, and only the entries a search touched are reset afterwards.
+fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
     offsets: &[u32],
     edges: &[(u32, u32)],
-    s: u32,
-    t: u32,
-    dist: &mut [u64],
+    (s, t): (u32, u32),
+    dist: &mut [T],
     touched: &mut Vec<u32>,
     heap: &mut RadixHeap,
-) -> Option<u64> {
-    dist[s as usize] = 0;
-    touched.push(s);
-    heap.push(0, s);
-    let mut answer = None;
-    while let Some((d, u)) = heap.pop() {
-        if u == t {
-            answer = Some(d);
-            break;
-        }
-        if d > dist[u as usize] {
-            continue; // stale entry: u was already settled closer
-        }
-        for &(v, w) in &edges[offsets[u as usize] as usize..offsets[u as usize + 1] as usize] {
-            let nd = d + w as u64;
-            if nd < dist[v as usize] {
-                if dist[v as usize] == u64::MAX {
-                    touched.push(v);
+) -> Result<Option<u64>, ()> {
+    let mut search = || {
+        dist[s as usize] = T::try_from(1).map_err(|_| ())?;
+        touched.push(s);
+        heap.push(0, s);
+        while let Some((d, u)) = heap.pop() {
+            if u == t {
+                return Ok(Some(d));
+            }
+            if d + 1 > dist[u as usize].into() {
+                continue; // stale entry: u was already settled closer
+            }
+            for &(v, w) in &edges[offsets[u as usize] as usize..offsets[u as usize + 1] as usize] {
+                let nd = d + w as u64;
+                let old = dist[v as usize];
+                if old == T::default() || nd + 1 < old.into() {
+                    if old == T::default() {
+                        touched.push(v);
+                    }
+                    dist[v as usize] = T::try_from(nd + 1).map_err(|_| ())?;
+                    heap.push(nd, v);
                 }
-                dist[v as usize] = nd;
-                heap.push(nd, v);
             }
         }
-    }
+        Ok(None)
+    };
+    let answer = search();
     for &v in touched.iter() {
-        dist[v as usize] = u64::MAX;
+        dist[v as usize] = T::default();
     }
     touched.clear();
     heap.clear();
@@ -275,7 +278,9 @@ fn main() {
     std::thread::scope(|scope| {
         for _ in 0..threads.min(list.len()) {
             scope.spawn(|| {
-                let (mut dist, mut touched) = (vec![u64::MAX; n], Vec::new());
+                // u32 distances halve the per-thread array; a search that overflows them (only the
+                // spec's near-2^32 weights do) is repeated with a u64 array made on first need.
+                let (mut dist, mut wide, mut touched) = (vec![0u32; n], Vec::new(), Vec::new());
                 let mut heap = RadixHeap {
                     buckets: vec![Vec::new(); 65],
                     last: 0,
@@ -285,18 +290,27 @@ fn main() {
                     let Some(&(s, t)) = list.get(i) else { break };
                     let reachable = s == t
                         || has_in[t as usize / 64].load(Ordering::Relaxed) >> (t % 64) & 1 == 1;
-                    if reachable {
-                        if let Some(d) = shortest(
-                            &offsets,
-                            &edges,
-                            rank[s as usize],
-                            rank[t as usize],
-                            &mut dist,
-                            &mut touched,
-                            &mut heap,
-                        ) {
-                            answers[i].store(d, Ordering::Relaxed);
-                        }
+                    if !reachable {
+                        continue;
+                    }
+                    let query = (rank[s as usize], rank[t as usize]);
+                    let answer =
+                        shortest(&offsets, &edges, query, &mut dist, &mut touched, &mut heap)
+                            .or_else(|_| {
+                                if wide.is_empty() {
+                                    wide = vec![0u64; n];
+                                }
+                                shortest(
+                                    &offsets,
+                                    &edges,
+                                    query,
+                                    &mut wide,
+                                    &mut touched,
+                                    &mut heap,
+                                )
+                            });
+                    if let Ok(Some(d)) = answer {
+                        answers[i].store(d, Ordering::Relaxed);
                     }
                 }
             });
