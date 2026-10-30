@@ -110,13 +110,14 @@ const EMPTY: Totals = Totals {
     note_bytes: 0,
 };
 
-/// Name -> id, shared by all threads without locks. A slot holds `tag << 32 | (id + 1)` (0 = empty),
-/// where `tag` is the high half of the name's hash; `spans[id]` says where the arena holds the
-/// name's bytes. All three arrays are zero-allocated, so pages the run never touches cost no memory.
+/// Name -> id, shared by all threads without locks. A slot holds `tag:10 | id + 1:22 | offset:32`
+/// (0 = empty): `tag` is the top of the name's hash and `offset` points into the arena, where the
+/// name is stored as a 2-byte length followed by its bytes and 8 bytes of padding. A lookup reads the
+/// slot and then one arena line. Ids stay dense, so the per-country bitsets stay small. The table and
+/// the arena come zeroed from calloc, so pages the run never touches cost no memory.
 struct Names {
     slots: Vec<AtomicU64>,
-    spans: Vec<AtomicU64>,
-    /// Start of a zeroed buffer as long as the input, leaked: every name fits in it.
+    /// Start of a zeroed buffer three times as long as the input, leaked: every name fits in it.
     arena: *mut u8,
     next_id: AtomicUsize,
     arena_used: AtomicUsize,
@@ -125,7 +126,7 @@ struct Names {
 }
 
 // SAFETY: the arena is written only in ranges handed out by `arena_used.fetch_add`, each to one
-// thread, and read only after the span that names the range was published with Release.
+// thread, and read only after the slot that names the range was published with Release.
 unsafe impl Sync for Names {}
 
 /// A zeroed vector of atomics straight from `calloc`, so its pages cost memory only once written.
@@ -137,59 +138,48 @@ fn zeroed_atomics(n: usize) -> Vec<AtomicU64> {
 
 impl Names {
     fn new(capacity: usize, arena_bytes: usize) -> Names {
+        assert!(capacity / 2 < 1 << 22 && arena_bytes < 1 << 32, "input too large for the name table");
         Names {
             slots: zeroed_atomics(capacity),
-            spans: zeroed_atomics(capacity),
-            arena: vec![0u8; arena_bytes.max(1)].leak().as_mut_ptr(),
+            arena: vec![0u8; arena_bytes].leak().as_mut_ptr(),
             next_id: AtomicUsize::new(0),
             arena_used: AtomicUsize::new(0),
             full: AtomicBool::new(false),
         }
     }
 
-    fn bytes(&self, id: usize) -> &[u8] {
-        let span = self.spans[id].load(Ordering::Acquire);
-        // SAFETY: the span was published after its bytes were written (see `id`).
-        unsafe {
-            std::slice::from_raw_parts(
-                self.arena.add((span >> 16) as usize),
-                (span & 0xFFFF) as usize,
-            )
-        }
-    }
-
     fn id(&self, name: &[u8]) -> usize {
         let h = hash(name);
-        let (tag, mask) = (h >> 32, self.slots.len() - 1);
+        let len = u16::try_from(name.len()).expect("name longer than 64 KiB");
+        let (tag, mask) = (h >> 54, self.slots.len() - 1);
         let mut i = h as usize & mask;
         loop {
             let mut slot = self.slots[i].load(Ordering::Acquire);
             if slot == 0 {
-                // Claim an id and arena space, publish the bytes, then try to take the slot.
+                // Claim an id and arena space, write the name there, then try to publish the slot.
                 let id = self.next_id.fetch_add(1, Ordering::Relaxed);
                 if id >= self.slots.len() / 2 {
                     self.full.store(true, Ordering::Relaxed);
                     return 0;
                 }
-                let at = self.arena_used.fetch_add(name.len() + 8, Ordering::Relaxed); // + padding for `word`
-                // SAFETY: `at..at + len` was handed to this thread alone by the fetch_add above, and
-                // nobody reads it before the span below is published with Release.
+                let at = self.arena_used.fetch_add(2 + name.len() + 8, Ordering::Relaxed);
+                // SAFETY: `at..at + 2 + len` was handed to this thread alone by the fetch_add above,
+                // and nobody reads it before the slot naming it is published with Release.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(name.as_ptr(), self.arena.add(at), name.len())
-                };
-                self.spans[id].store((at as u64) << 16 | name.len() as u64, Ordering::Release);
-                match self.slots[i].compare_exchange(
-                    0,
-                    tag << 32 | (id as u64 + 1),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
+                    std::ptr::copy_nonoverlapping(len.to_le_bytes().as_ptr(), self.arena.add(at), 2);
+                    std::ptr::copy_nonoverlapping(name.as_ptr(), self.arena.add(at + 2), name.len());
+                }
+                match self.slots[i].compare_exchange(0, tag << 54 | (id as u64 + 1) << 32 | at as u64, Ordering::AcqRel, Ordering::Acquire) {
                     Ok(_) => return id,
                     Err(other) => slot = other, // another thread won this slot; its id stays unused
                 }
             }
-            if slot >> 32 == tag && same(self.bytes((slot as u32 - 1) as usize), name) {
-                return (slot as u32 - 1) as usize;
+            if slot >> 54 == tag {
+                // SAFETY: the slot was published after its arena entry was written.
+                let entry = unsafe { std::slice::from_raw_parts(self.arena.add(slot as u32 as usize), 2 + name.len()) };
+                if entry[..2] == len.to_le_bytes() && same(&entry[2..], name) {
+                    return (slot >> 32 & 0x3F_FFFF) as usize - 1;
+                }
             }
             i = (i + 1) & mask;
         }
@@ -423,7 +413,7 @@ fn main() {
     // names fits; if a dataset has more distinct names, the run is repeated with 4 times as many.
     let mut capacity = 1 << 18;
     let (totals, names, seen, words) = loop {
-        let names = Names::new(capacity, data.len() * 2); // names + 8 bytes of padding each
+        let names = Names::new(capacity, data.len() * 3); // names + 10 bytes of length and padding each
         let words = capacity / 2 / 64;
         let seen = zeroed_atomics(words * keys.len());
         let next = AtomicUsize::new(0);
