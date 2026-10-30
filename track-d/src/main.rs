@@ -6,11 +6,9 @@
 //! 2. Renumber the nodes in breadth-first order: the input ids are a random relabelling, so without
 //!    this every step of a search is a cache miss. A third pass scatters the edges straight into the
 //!    renumbered CSR, after the first one has been freed.
-//! 3. Answer the queries in parallel, one Dijkstra per query with a binary heap, stopping when the
+//! 3. Answer the queries in parallel, one Dijkstra per query with a radix heap, stopping when the
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
 //!    Each thread keeps one distance array and resets only the nodes the last search touched.
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
@@ -106,6 +104,41 @@ fn prefix_sums(counts: impl Iterator<Item = u32>) -> Vec<u32> {
     offsets
 }
 
+/// Radix heap: a priority queue for integer keys that never go below the last key popped, which
+/// Dijkstra guarantees. Bucket i holds the keys whose highest bit that differs from `last` is bit
+/// i - 1, so a pop only rescans one bucket and every entry moves down at most 64 times.
+struct RadixHeap {
+    buckets: Vec<Vec<(u64, u32)>>,
+    last: u64,
+}
+
+impl RadixHeap {
+    fn bucket(&self, key: u64) -> usize {
+        64 - (key ^ self.last).leading_zeros() as usize
+    }
+    fn push(&mut self, key: u64, node: u32) {
+        let b = self.bucket(key);
+        self.buckets[b].push((key, node));
+    }
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        if self.buckets[0].is_empty() {
+            let i = self.buckets.iter().position(|b| !b.is_empty())?;
+            let mut moved = std::mem::take(&mut self.buckets[i]);
+            self.last = moved.iter().map(|e| e.0).min().unwrap();
+            for &(key, node) in &moved {
+                self.push(key, node); // always lands in a bucket below i
+            }
+            moved.clear();
+            self.buckets[i] = moved; // keep the allocation
+        }
+        self.buckets[0].pop()
+    }
+    fn clear(&mut self) {
+        self.buckets.iter_mut().for_each(Vec::clear);
+        self.last = 0;
+    }
+}
+
 /// Shortest distance from `s` to `t`, or None if `t` is not reachable. `dist` is all-MAX on entry
 /// and on return; only the entries a search touched are reset.
 fn shortest(
@@ -115,13 +148,13 @@ fn shortest(
     t: u32,
     dist: &mut [u64],
     touched: &mut Vec<u32>,
+    heap: &mut RadixHeap,
 ) -> Option<u64> {
-    let mut heap = BinaryHeap::new();
     dist[s as usize] = 0;
     touched.push(s);
-    heap.push(Reverse((0u64, s)));
+    heap.push(0, s);
     let mut answer = None;
-    while let Some(Reverse((d, u))) = heap.pop() {
+    while let Some((d, u)) = heap.pop() {
         if u == t {
             answer = Some(d);
             break;
@@ -136,7 +169,7 @@ fn shortest(
                     touched.push(v);
                 }
                 dist[v as usize] = nd;
-                heap.push(Reverse((nd, v)));
+                heap.push(nd, v);
             }
         }
     }
@@ -144,6 +177,7 @@ fn shortest(
         dist[v as usize] = u64::MAX;
     }
     touched.clear();
+    heap.clear();
     answer
 }
 
@@ -218,6 +252,10 @@ fn main() {
         for _ in 0..threads.min(list.len()) {
             scope.spawn(|| {
                 let (mut dist, mut touched) = (vec![u64::MAX; n], Vec::new());
+                let mut heap = RadixHeap {
+                    buckets: vec![Vec::new(); 65],
+                    last: 0,
+                };
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed) as usize;
                     let Some(&(s, t)) = list.get(i) else { break };
@@ -231,6 +269,7 @@ fn main() {
                             rank[t as usize],
                             &mut dist,
                             &mut touched,
+                            &mut heap,
                         ) {
                             answers[i].store(d, Ordering::Relaxed);
                         }
