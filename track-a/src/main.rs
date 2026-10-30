@@ -5,9 +5,11 @@
 //! 2. Merge the endpoint tables into one sorted list, so that a group id
 //!    `(hour - first_hour) * endpoints + endpoint_rank` is already the output order.
 //! 3. Each thread rewrites its records in place as `group << 33 | 5xx << 32 | latency` and sorts
-//!    them, so every group is one contiguous run per chunk. No other per-line array is allocated.
+//!    them, so every group is one contiguous run per chunk. It then keeps only the latencies, packed
+//!    two per u64 in the same buffer (shrunk to half), and one `[group, start, end, 5xx]` per run.
 //! 4. Groups are formatted in parallel ranges: a group's runs are gathered from every chunk into a
-//!    small scratch buffer and the nearest-rank percentiles come from `select_nth_unstable`.
+//!    small scratch buffer and the nearest-rank percentiles come from `select_nth_unstable`. The
+//!    output's page cache counts as memory, so the latencies are freed before it is written.
 use std::io::Write;
 
 unsafe extern "C" {
@@ -249,9 +251,11 @@ fn main() {
     let groups = (hi - lo + 1) as usize * names.len();
     assert!(groups < 1 << 31, "too many (hour, endpoint) groups");
 
-    // Phase 3: rewrite every record as (group, 5xx, latency) and sort each chunk by group.
-    std::thread::scope(|scope| {
-        for shard in shards.iter_mut() {
+    // Phase 3: rewrite every record as (group, 5xx, latency) and sort each chunk by group. Then
+    // keep only the latencies, packed two per u64 in the same buffer, which is shrunk to half, and
+    // one run `[group, start, end, errors]` per group present in the chunk.
+    let runs: Vec<Vec<[u32; 4]>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = shards.iter_mut().map(|shard| {
             let names = &names;
             scope.spawn(move || {
                 let ranks: Vec<u64> = shard
@@ -266,9 +270,28 @@ fn main() {
                     *r = group << 33 | (*r >> 48 & 1) << 32 | (*r as u32 as u64);
                 }
                 shard.records.sort_unstable();
-            });
-        }
+                let (n, mut runs) = (shard.records.len(), Vec::<[u32; 4]>::new());
+                let at = shard.records.as_mut_ptr();
+                for i in 0..n {
+                    // SAFETY: latency i goes to bytes 4i..4i + 4, inside record i / 2 <= i, which
+                    // has already been read.
+                    let r = unsafe { *at.add(i) };
+                    unsafe { *(at as *mut u32).add(i) = r as u32 };
+                    match runs.last_mut() {
+                        Some(last) if last[0] == (r >> 33) as u32 => last[2] += 1,
+                        _ => runs.push([(r >> 33) as u32, i as u32, i as u32 + 1, 0]),
+                    }
+                    runs.last_mut().unwrap()[3] += (r >> 32 & 1) as u32;
+                }
+                shard.records.truncate(n.div_ceil(2));
+                shard.records.shrink_to_fit();
+                runs
+            })
+        }).collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
+    // SAFETY: u32 has a smaller alignment than u64, and every bit pattern is a valid u32.
+    let lats: Vec<&[u32]> = shards.iter().map(|s| unsafe { std::slice::from_raw_parts(s.records.as_ptr() as *const u32, s.records.len() * 2) }).collect();
 
     // Phase 4: format contiguous ranges of groups in parallel. Each range finds where its first
     // group starts in every chunk, then walks all chunks forward in step.
@@ -283,26 +306,24 @@ fn main() {
     let parts: Vec<Vec<u8>> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..ranges)
             .map(|k| {
-                let (shards, names, hour_text) = (&shards, &names, &hour_text);
+                let (runs, lats, names, hour_text) = (&runs, &lats, &names, &hour_text);
                 scope.spawn(move || {
                     let (first, last) = (
                         (groups * k / ranges) as u64,
                         (groups * (k + 1) / ranges) as u64,
                     );
-                    let mut cursors: Vec<usize> = shards
+                    let mut cursors: Vec<usize> = runs
                         .iter()
-                        .map(|s| s.records.partition_point(|&r| r >> 33 < first))
+                        .map(|r| r.partition_point(|run| (run[0] as u64) < first))
                         .collect();
                     let (mut text, mut values) = (Vec::new(), Vec::new());
                     for g in first..last {
                         values.clear();
                         let mut errors = 0u64;
-                        for (shard, cursor) in shards.iter().zip(cursors.iter_mut()) {
-                            while let Some(&r) =
-                                shard.records.get(*cursor).filter(|&&r| r >> 33 == g)
-                            {
-                                values.push(r as u32);
-                                errors += r >> 32 & 1;
+                        for ((runs, lats), cursor) in runs.iter().zip(lats).zip(cursors.iter_mut()) {
+                            if let Some(run) = runs.get(*cursor).filter(|run| run[0] as u64 == g) {
+                                values.extend_from_slice(&lats[run[1] as usize..run[2] as usize]);
+                                errors += run[3] as u64;
                                 *cursor += 1;
                             }
                         }
@@ -347,6 +368,9 @@ fn main() {
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
+    // The output's page cache counts as this run's memory: free the records first, and every
+    // part as soon as it is written.
+    drop((lats, shards));
     for text in parts {
         out.write_all(&text).expect("cannot write output");
     }
