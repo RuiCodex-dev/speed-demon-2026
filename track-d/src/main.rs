@@ -9,7 +9,7 @@
 //! 3. Answer the queries in parallel, one Dijkstra per query with a radix heap, stopping when the
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
 //!    Each thread keeps one distance array and resets only the nodes the last search touched.
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -210,25 +210,49 @@ fn main() {
 
     // Pass 2: the CSR in input ids, used only to find a breadth-first order.
     let edges = scatter(&chunks, &offsets, &|u| u);
-    let mut rank = vec![u32::MAX; n];
-    let mut order: Vec<u32> = Vec::with_capacity(n);
-    for root in 0..n as u32 {
-        if rank[root as usize] != u32::MAX {
-            continue;
+    // Every thread grows a breadth-first region from its own seed and claims nodes with an atomic
+    // flag, so each region gets contiguous new ids. Nodes no seed reaches (islands, isolated nodes)
+    // are numbered afterwards by the same search, run serially from each of them.
+    let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
+    let grow = |seed: u32, region: &mut Vec<u32>| {
+        if claimed[seed as usize].swap(true, Ordering::Relaxed) {
+            return;
         }
-        rank[root as usize] = order.len() as u32;
-        order.push(root);
-        let mut head = order.len() - 1;
-        while head < order.len() {
-            let u = order[head] as usize;
+        let mut head = region.len();
+        region.push(seed);
+        while head < region.len() {
+            let u = region[head] as usize;
             head += 1;
             for &(v, _) in &edges[offsets[u] as usize..offsets[u + 1] as usize] {
-                if rank[v as usize] == u32::MAX {
-                    rank[v as usize] = order.len() as u32;
-                    order.push(v);
+                if !claimed[v as usize].load(Ordering::Relaxed)
+                    && !claimed[v as usize].swap(true, Ordering::Relaxed)
+                {
+                    region.push(v);
                 }
             }
         }
+    };
+    let regions: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|k| {
+                let grow = &grow;
+                scope.spawn(move || {
+                    let mut region = Vec::new();
+                    grow((n * k / threads) as u32, &mut region);
+                    region
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let mut order: Vec<u32> = regions.concat();
+    drop(regions);
+    for root in 0..n as u32 {
+        grow(root, &mut order);
+    }
+    let mut rank = vec![0u32; n];
+    for (new, &old) in order.iter().enumerate() {
+        rank[old as usize] = new as u32;
     }
     drop(edges);
     let offsets = prefix_sums(order.iter().map(|&old| degree[old as usize]));
