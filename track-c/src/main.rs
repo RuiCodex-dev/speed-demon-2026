@@ -5,12 +5,15 @@
 //!    `""` escapes come in pairs (spec 2.1), so a byte is inside quotes exactly when an odd number of
 //!    `"` precede it: a parallel quote count plus a prefix parity tells every chunk where it starts,
 //!    and the chunk then begins after its first record terminator outside quotes.
-//! 3. Each thread parses its records with a byte state machine and aggregates per country. Names are
-//!    interned per thread; the tables are merged into global ids and a bitset per country counts
-//!    distinct names.
+//! 3. Each thread parses its records with a byte state machine and keeps per-country totals.
+//! 4. Distinct names per country, exactly and in parallel: every name belongs to the partition
+//!    `hash % threads`. Threads intern names locally and file both their new names and their
+//!    (country, name) pairs under that partition; then each partition's owner merges only its own
+//!    names from all threads and counts them with one small bitset per country.
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::Write;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -72,9 +75,16 @@ const EMPTY: Totals = Totals {
 
 struct Shard {
     totals: Vec<Totals>,
+    /// Name -> thread-local id.
     names: FxMap<&'static [u8], u32>,
-    /// (country, thread-local name id) for every record, deduplicated later through bitsets.
-    pairs: Vec<(u16, u32)>,
+    /// Partition of each local id.
+    partition_of: Vec<u8>,
+    /// Per partition: (local id, name) of the names this thread met first.
+    new_names: Vec<Vec<(u32, &'static [u8])>>,
+    /// Per partition: (country, local name id) for every record.
+    pairs: Vec<Vec<(u16, u32)>>,
+    /// Local id -> id inside its partition, written by that partition's owner only.
+    partition_id: Vec<AtomicU32>,
 }
 
 /// Reads a text field starting at `*p` and leaves `*p` on the byte after it (`,` or a terminator).
@@ -113,6 +123,16 @@ fn integer(data: &[u8], p: &mut usize) -> u64 {
     value
 }
 
+fn unescape(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        out.push(raw[i]);
+        i += if raw[i] == b'"' { 2 } else { 1 };
+    }
+    out
+}
+
 /// Parses whole records in `data[start..end]` (both on record boundaries) into `shard`.
 fn parse(
     data: &'static [u8],
@@ -122,6 +142,7 @@ fn parse(
     unmatched: u16,
     shard: &mut Shard,
 ) {
+    let parts = shard.pairs.len() as u64;
     let mut p = start;
     while p < end {
         if data[p..].starts_with(BOM) {
@@ -158,20 +179,15 @@ fn parse(
         } else {
             Box::leak(unescape(name).into_boxed_slice())
         };
-        let next = shard.names.len() as u32;
-        let local = *shard.names.entry(key).or_insert(next);
-        shard.pairs.push((country, local));
+        let next = shard.partition_of.len() as u32;
+        let local = *shard.names.entry(key).or_insert_with(|| {
+            let part = (BuildHasherDefault::<Fx>::default().hash_one(key) % parts) as usize;
+            shard.partition_of.push(part as u8);
+            shard.new_names[part].push((next, key));
+            next
+        });
+        shard.pairs[shard.partition_of[local as usize] as usize].push((country, local));
     }
-}
-
-fn unescape(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
-    let mut i = 0;
-    while i < raw.len() {
-        out.push(raw[i]);
-        i += if raw[i] == b'"' { 2 } else { 1 };
-    }
-    out
 }
 
 fn push_num(out: &mut Vec<u8>, mut value: u64) {
@@ -201,36 +217,55 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(255);
 
-    // regions.csv: plain `region_id,country` lines after a header.
+    // regions.csv: plain `region_id,country` lines after a header, in one pass. Country codes get
+    // temporary ids in order of appearance, which are then renumbered in sorted order.
     let regions = map_file(&format!("{data_dir}/regions.csv"));
-    let rows: Vec<(usize, &[u8])> = regions
+    let mut seen: FxMap<&[u8], u16> = FxMap::default();
+    let mut region_code: Vec<u16> = Vec::new();
+    for line in regions
         .split(|&b| b == b'\n')
         .skip(1)
         .filter(|line| !line.is_empty())
-        .map(|line| {
-            let comma = line
-                .iter()
-                .position(|&b| b == b',')
-                .expect("bad regions.csv line");
-            (
-                line[..comma]
-                    .iter()
-                    .fold(0, |acc, &b| acc * 10 + (b - b'0') as usize),
-                &line[comma + 1..],
-            )
+    {
+        let comma = line
+            .iter()
+            .position(|&b| b == b',')
+            .expect("bad regions.csv line");
+        let region = line[..comma]
+            .iter()
+            .fold(0, |acc, &b| acc * 10 + (b - b'0') as usize);
+        let next = seen.len() as u16;
+        let code = *seen.entry(&line[comma + 1..]).or_insert(next);
+        if region >= region_code.len() {
+            region_code.resize(region + 1, u16::MAX);
+        }
+        region_code[region] = code;
+    }
+    let mut keys: Vec<&[u8]> = seen.keys().copied().collect();
+    keys.sort_unstable();
+    let unmatched = keys.len() as u16;
+    let rank: Vec<u16> = {
+        let mut rank = vec![0u16; keys.len()];
+        for (sorted, key) in keys.iter().enumerate() {
+            rank[seen[key] as usize] = sorted as u16;
+        }
+        rank
+    };
+    let country_of: Vec<u16> = region_code
+        .iter()
+        .map(|&c| {
+            if c == u16::MAX {
+                unmatched
+            } else {
+                rank[c as usize]
+            }
         })
         .collect();
-    let mut keys: Vec<&[u8]> = rows.iter().map(|r| r.1).collect();
-    keys.sort_unstable();
-    keys.dedup();
-    let unmatched = keys.len() as u16;
     keys.push(b"_UNMATCHED"); // `_` sorts after every [A-Z] code, so it stays last
-    let mut country_of = vec![unmatched; rows.iter().map(|r| r.0 + 1).max().unwrap_or(0)];
-    for &(region, country) in &rows {
-        country_of[region] = keys.binary_search(&country).unwrap() as u16;
-    }
 
     // records.csv: skip the BOM and the header, then cut the body into chunks.
     let data = map_file(&format!("{data_dir}/records.csv"));
@@ -244,11 +279,25 @@ fn main() {
         .map(|i| body + (data.len() - body) * i / parts)
         .collect();
     let quotes: Vec<usize> = std::thread::scope(|scope| {
-        let workers: Vec<_> = cuts
-            .windows(2)
-            .map(|w| scope.spawn(move || data[w[0]..w[1]].iter().filter(|&&b| b == b'"').count()))
+        let workers: Vec<_> = (0..threads)
+            .map(|k| {
+                let cuts = &cuts;
+                scope.spawn(move || {
+                    (parts * k / threads..parts * (k + 1) / threads)
+                        .map(|i| {
+                            data[cuts[i]..cuts[i + 1]]
+                                .iter()
+                                .filter(|&&b| b == b'"')
+                                .count()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).collect()
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
     });
     // Each cut moves forward to just after the first terminator outside quotes.
     let mut starts = vec![body];
@@ -265,7 +314,7 @@ fn main() {
     }
     starts.push(data.len());
 
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    let next = AtomicUsize::new(0);
     let shards: Vec<Shard> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {
@@ -273,10 +322,13 @@ fn main() {
                     let mut shard = Shard {
                         totals: vec![EMPTY; keys.len()],
                         names: FxMap::default(),
-                        pairs: Vec::new(),
+                        partition_of: Vec::new(),
+                        new_names: vec![Vec::new(); threads],
+                        pairs: vec![Vec::new(); threads],
+                        partition_id: Vec::new(),
                     };
                     loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let i = next.fetch_add(1, Ordering::Relaxed);
                         if i >= parts {
                             break;
                         }
@@ -289,6 +341,9 @@ fn main() {
                             &mut shard,
                         );
                     }
+                    shard.partition_id = (0..shard.partition_of.len())
+                        .map(|_| AtomicU32::new(0))
+                        .collect();
                     shard
                 })
             })
@@ -296,27 +351,38 @@ fn main() {
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
 
-    // Global name ids, then one bitset per country over them.
-    let mut global: FxMap<&[u8], u32> = FxMap::default();
-    let local_to_global: Vec<Vec<u32>> = shards
-        .iter()
-        .map(|shard| {
-            let mut map = vec![0u32; shard.names.len()];
-            for (&name, &local) in &shard.names {
-                let next = global.len() as u32;
-                map[local as usize] = *global.entry(name).or_insert(next);
-            }
-            map
-        })
-        .collect();
-    let words = global.len().div_ceil(64);
-    let mut seen = vec![0u64; words * keys.len()];
-    for (shard, map) in shards.iter().zip(&local_to_global) {
-        for &(country, local) in &shard.pairs {
-            let g = map[local as usize] as usize;
-            seen[country as usize * words + g / 64] |= 1 << (g % 64);
-        }
-    }
+    // Distinct names, one partition per thread: merge the partition's names from every shard, then
+    // set one bit per (country, name) and count. Returns the count per country.
+    let distinct: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|part| {
+                let (shards, keys) = (&shards, &keys);
+                scope.spawn(move || {
+                    let mut ids: FxMap<&[u8], u32> = FxMap::default();
+                    for shard in shards {
+                        for &(local, name) in &shard.new_names[part] {
+                            let next = ids.len() as u32;
+                            shard.partition_id[local as usize]
+                                .store(*ids.entry(name).or_insert(next), Ordering::Relaxed);
+                        }
+                    }
+                    let words = ids.len().div_ceil(64);
+                    let mut bits = vec![0u64; words * keys.len()];
+                    for shard in shards {
+                        for &(country, local) in &shard.pairs[part] {
+                            let id =
+                                shard.partition_id[local as usize].load(Ordering::Relaxed) as usize;
+                            bits[country as usize * words + id / 64] |= 1 << (id % 64);
+                        }
+                    }
+                    bits.chunks(words.max(1))
+                        .map(|c| c.iter().map(|w| w.count_ones()).sum())
+                        .collect::<Vec<u32>>()
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
 
     let mut out = Vec::new();
     for (c, key) in keys.iter().enumerate() {
@@ -334,9 +400,9 @@ fn main() {
         if t.count == 0 {
             continue;
         }
-        let distinct: u32 = seen[c * words..(c + 1) * words]
+        let names: u32 = distinct
             .iter()
-            .map(|w| w.count_ones())
+            .map(|d| d.get(c).copied().unwrap_or(0))
             .sum();
         out.extend_from_slice(key);
         for value in [t.count, t.id_sum] {
@@ -347,7 +413,7 @@ fn main() {
             out.push(b' ');
             push_money(&mut out, cents);
         }
-        for value in [distinct as u64, t.name_bytes, t.note_bytes] {
+        for value in [names as u64, t.name_bytes, t.note_bytes] {
             out.push(b' ');
             push_num(&mut out, value);
         }
