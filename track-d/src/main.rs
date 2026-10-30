@@ -256,7 +256,7 @@ fn main() {
     // are numbered afterwards by the same search, run serially from each of them.
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let grow = |seed: u32, region: &mut Vec<u32>| {
-        if claimed[seed as usize].swap(true, Ordering::Relaxed) {
+        if claimed[seed as usize].load(Ordering::Relaxed) || claimed[seed as usize].swap(true, Ordering::Relaxed) {
             return;
         }
         let mut head = region.len();
