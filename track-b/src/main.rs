@@ -213,6 +213,9 @@ struct Phrases {
     fail: Vec<u32>,
     /// The nearest state on the failure chain, itself included, that ends a phrase (or u32::MAX).
     out: Vec<u32>,
+    /// Bit `t % 64` is set if the state has a transition on a term `t`: most lookups that would
+    /// fail are skipped without touching `goto`.
+    child_mask: Vec<u64>,
 }
 
 impl Phrases {
@@ -223,6 +226,7 @@ impl Phrases {
             goto: FxMap::default(),
             fail: vec![0],
             out: vec![u32::MAX],
+            child_mask: vec![0],
         };
         let mut children: Vec<Vec<(u32, u32)>> = vec![Vec::new()];
         let mut terminal = vec![false];
@@ -244,6 +248,8 @@ impl Phrases {
                         children.push(Vec::new());
                         terminal.push(false);
                         children[s as usize].push((t, new));
+                        a.child_mask.push(0);
+                        a.child_mask[s as usize] |= 1 << (t % 64);
                         if s == 0 {
                             a.root[t as usize] = new;
                         } else {
@@ -280,8 +286,10 @@ impl Phrases {
             if s == 0 {
                 return self.root[t as usize];
             }
-            if let Some(&next) = self.goto.get(&((s as u64) << 32 | t as u64)) {
-                return next;
+            if self.child_mask[s as usize] >> (t % 64) & 1 == 1 {
+                if let Some(&next) = self.goto.get(&((s as u64) << 32 | t as u64)) {
+                    return next;
+                }
             }
             s = self.fail[s as usize];
         }
@@ -348,6 +356,8 @@ fn line_start(data: &[u8], mut pos: usize) -> usize {
     }
     pos.min(data.len())
 }
+
+const NEWLINE: u8 = 10;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -476,6 +486,20 @@ fn main() {
                             // Postings are filed by term range, one range per thread for the sort.
                             let (mut postings, mut matches) =
                                 (vec![Vec::new(); threads], Vec::new());
+                            // Bits for frequent terms go to a bitmap local to this chunk's documents
+                            // and are merged with one atomic OR per word at the end.
+                            let id = |line: &[u8]| {
+                                line.iter()
+                                    .take_while(|b| b.is_ascii_digit())
+                                    .fold(0, |a, &b| a * 10 + (b - b'0') as usize)
+                            };
+                            let last = chunk[..chunk.len() - 1]
+                                .iter()
+                                .rposition(|&b| b == NEWLINE)
+                                .map_or(0, |i| i + 1);
+                            let (base, span) =
+                                (id(chunk) / 64, id(&chunk[last..]) / 64 + 1 - id(chunk) / 64);
+                            let mut local = vec![0u64; dense_count as usize * span];
                             for_each_doc(chunk, |doc, text| {
                                 let mut state = 0;
                                 tokens(text, |token, h| {
@@ -489,9 +513,8 @@ fn main() {
                                             u32::MAX => postings[t as usize * threads / term_count]
                                                 .push((t, doc)),
                                             d => {
-                                                let word = &bitmaps
-                                                    [d as usize * words + doc as usize / 64];
-                                                word.fetch_or(1 << (doc % 64), Ordering::Relaxed);
+                                                local[d as usize * span + doc as usize / 64
+                                                    - base] |= 1 << (doc % 64)
                                             }
                                         }
                                     }
@@ -506,6 +529,10 @@ fn main() {
                                     }
                                 });
                             });
+                            for (i, &bits) in local.iter().enumerate().filter(|(_, b)| **b != 0) {
+                                bitmaps[i / span * words + base + i % span]
+                                    .fetch_or(bits, Ordering::Relaxed);
+                            }
                             done.push((c, postings, matches));
                         }
                         done
