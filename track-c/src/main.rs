@@ -236,11 +236,11 @@ fn unescape(raw: &[u8]) -> (Vec<u8>, usize) {
 
 /// Parses whole records in `data[start..end]` (both on record boundaries): totals into `totals`,
 /// one bit per (country, name id) into `seen`, which has `words` words per country.
-fn parse(
+fn parse<C: Copy + Into<u16>>(
     data: &'static [u8],
     start: usize,
     end: usize,
-    country_of: &[u16],
+    country_of: &[C],
     unmatched: u16,
     totals: &mut [Totals],
     names: &Names,
@@ -268,7 +268,7 @@ fn parse(
         p += 3;
         p += if data.get(p) == Some(&b'\r') { 2 } else { 1 };
 
-        let country = country_of.get(region).copied().unwrap_or(unmatched);
+        let country = country_of.get(region).map_or(unmatched, |&c| c.into());
         let t = &mut totals[country as usize];
         t.count += 1;
         t.id_sum += id;
@@ -360,6 +360,9 @@ fn main() {
             }
         })
         .collect();
+    // With up to 255 countries the map is one byte per region (1 MB for the spec's ids), which stays
+    // in the scoring CPU's L2 cache; the per-record lookup was a cache miss at two bytes.
+    let small_map: Vec<u8> = if keys.len() < 255 { country_of.iter().map(|&c| c as u8).collect() } else { Vec::new() };
     keys.push(b"_UNMATCHED"); // `_` sorts after every [A-Z] code, so it stays last
 
     // records.csv: skip the BOM and the header, then cut the body into chunks.
@@ -425,17 +428,11 @@ fn main() {
                         while let Some(w) =
                             starts.windows(2).nth(next.fetch_add(1, Ordering::Relaxed))
                         {
-                            parse(
-                                data,
-                                w[0],
-                                w[1],
-                                &country_of,
-                                unmatched,
-                                &mut totals,
-                                &names,
-                                &seen,
-                                words,
-                            );
+                            if small_map.is_empty() {
+                                parse(data, w[0], w[1], &country_of, unmatched, &mut totals, &names, &seen, words);
+                            } else {
+                                parse(data, w[0], w[1], &small_map, unmatched, &mut totals, &names, &seen, words);
+                            }
                         }
                         totals
                     })
