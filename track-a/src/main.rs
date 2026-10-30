@@ -36,12 +36,18 @@ fn map_file(path: &str) -> &'static [u8] {
 fn word(name: &[u8], i: usize) -> u64 {
     // SAFETY: see above; `name` is a slice of the mapped file with that tail after it.
     let w = unsafe { std::ptr::read_unaligned(name.as_ptr().add(i) as *const u64) };
-    if name.len() - i >= 8 { w } else { w & ((1 << (8 * (name.len() - i))) - 1) }
+    if name.len() - i >= 8 {
+        w
+    } else {
+        w & ((1 << (8 * (name.len() - i))) - 1)
+    }
 }
 
 /// FxHash-style hash of an endpoint: one rotate, xor and multiply per 8 bytes, no copying.
 fn hash(name: &[u8]) -> u64 {
-    (0..name.len()).step_by(8).fold(name.len() as u64, |h, i| (h.rotate_left(5) ^ word(name, i)).wrapping_mul(0x517cc1b727220a95))
+    (0..name.len()).step_by(8).fold(name.len() as u64, |h, i| {
+        (h.rotate_left(5) ^ word(name, i)).wrapping_mul(0x517cc1b727220a95)
+    })
 }
 
 /// Byte equality of two endpoints, 8 bytes at a time.
@@ -255,43 +261,51 @@ fn main() {
     // keep only the latencies, packed two per u64 in the same buffer, which is shrunk to half, and
     // one run `[group, start, end, errors]` per group present in the chunk.
     let runs: Vec<Vec<[u32; 4]>> = std::thread::scope(|scope| {
-        let workers: Vec<_> = shards.iter_mut().map(|shard| {
-            let names = &names;
-            scope.spawn(move || {
-                let ranks: Vec<u64> = shard
-                    .endpoints
-                    .names
-                    .iter()
-                    .map(|e| names.binary_search(&e.0).unwrap() as u64)
-                    .collect();
-                for r in shard.records.iter_mut() {
-                    let group =
-                        ((*r >> 49) - lo) * names.len() as u64 + ranks[(*r >> 32) as u16 as usize];
-                    *r = group << 33 | (*r >> 48 & 1) << 32 | (*r as u32 as u64);
-                }
-                shard.records.sort_unstable();
-                let (n, mut runs) = (shard.records.len(), Vec::<[u32; 4]>::new());
-                let at = shard.records.as_mut_ptr();
-                for i in 0..n {
-                    // SAFETY: latency i goes to bytes 4i..4i + 4, inside record i / 2 <= i, which
-                    // has already been read.
-                    let r = unsafe { *at.add(i) };
-                    unsafe { *(at as *mut u32).add(i) = r as u32 };
-                    match runs.last_mut() {
-                        Some(last) if last[0] == (r >> 33) as u32 => last[2] += 1,
-                        _ => runs.push([(r >> 33) as u32, i as u32, i as u32 + 1, 0]),
+        let workers: Vec<_> = shards
+            .iter_mut()
+            .map(|shard| {
+                let names = &names;
+                scope.spawn(move || {
+                    let ranks: Vec<u64> = shard
+                        .endpoints
+                        .names
+                        .iter()
+                        .map(|e| names.binary_search(&e.0).unwrap() as u64)
+                        .collect();
+                    for r in shard.records.iter_mut() {
+                        let group = ((*r >> 49) - lo) * names.len() as u64
+                            + ranks[(*r >> 32) as u16 as usize];
+                        *r = group << 33 | (*r >> 48 & 1) << 32 | (*r as u32 as u64);
                     }
-                    runs.last_mut().unwrap()[3] += (r >> 32 & 1) as u32;
-                }
-                shard.records.truncate(n.div_ceil(2));
-                shard.records.shrink_to_fit();
-                runs
+                    shard.records.sort_unstable();
+                    let (n, mut runs) = (shard.records.len(), Vec::<[u32; 4]>::new());
+                    let at = shard.records.as_mut_ptr();
+                    for i in 0..n {
+                        // SAFETY: latency i goes to bytes 4i..4i + 4, inside record i / 2 <= i, which
+                        // has already been read.
+                        let r = unsafe { *at.add(i) };
+                        unsafe { *(at as *mut u32).add(i) = r as u32 };
+                        match runs.last_mut() {
+                            Some(last) if last[0] == (r >> 33) as u32 => last[2] += 1,
+                            _ => runs.push([(r >> 33) as u32, i as u32, i as u32 + 1, 0]),
+                        }
+                        runs.last_mut().unwrap()[3] += (r >> 32 & 1) as u32;
+                    }
+                    shard.records.truncate(n.div_ceil(2));
+                    shard.records.shrink_to_fit();
+                    runs
+                })
             })
-        }).collect();
+            .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
     // SAFETY: u32 has a smaller alignment than u64, and every bit pattern is a valid u32.
-    let lats: Vec<&[u32]> = shards.iter().map(|s| unsafe { std::slice::from_raw_parts(s.records.as_ptr() as *const u32, s.records.len() * 2) }).collect();
+    let lats: Vec<&[u32]> = shards
+        .iter()
+        .map(|s| unsafe {
+            std::slice::from_raw_parts(s.records.as_ptr() as *const u32, s.records.len() * 2)
+        })
+        .collect();
 
     // Phase 4: format contiguous ranges of groups in parallel. Each range finds where its first
     // group starts in every chunk, then walks all chunks forward in step.
@@ -320,43 +334,28 @@ fn main() {
                     for g in first..last {
                         values.clear();
                         let mut errors = 0u64;
-                        for ((runs, lats), cursor) in runs.iter().zip(lats).zip(cursors.iter_mut()) {
+                        for ((runs, lats), cursor) in runs.iter().zip(lats).zip(cursors.iter_mut())
+                        {
                             if let Some(run) = runs.get(*cursor).filter(|run| run[0] as u64 == g) {
                                 values.extend_from_slice(&lats[run[1] as usize..run[2] as usize]);
                                 errors += run[3] as u64;
                                 *cursor += 1;
                             }
                         }
-                        let n = values.len();
-                        if n == 0 {
+                        if values.is_empty() {
                             continue;
                         }
-                        let rank = |p: usize| (p * n + 99) / 100 - 1;
-                        let (r50, r95, r99) = (rank(50), rank(95), rank(99));
-                        // After selecting rank r, the r smallest values sit in values[..r], so each
-                        // lower rank is selected inside the previous prefix.
-                        let p99 = *values.select_nth_unstable(r99).1;
-                        let p95 = if r95 < r99 {
-                            *values[..r99].select_nth_unstable(r95).1
-                        } else {
-                            p99
-                        };
-                        let p50 = if r50 < r95 {
-                            *values[..r95].select_nth_unstable(r50).1
-                        } else {
-                            p95
-                        };
+                        // Nearest rank: the ceil(p * n / 100)-th smallest. After selecting rank r, the
+                        // values before it are the r smallest, so each lower rank is selected there.
+                        let n = values.len() as u64;
+                        let rank = |p: u64| ((p * n).div_ceil(100) - 1) as usize;
+                        let p99 = *values.select_nth_unstable(rank(99)).1 as u64;
+                        let p95 = *values[..=rank(99)].select_nth_unstable(rank(95)).1 as u64;
+                        let p50 = *values[..=rank(95)].select_nth_unstable(rank(50)).1 as u64;
                         let g = g as usize;
                         text.extend_from_slice(hour_text[g / names.len()].as_bytes());
                         text.extend_from_slice(names[g % names.len()]);
-                        for value in [
-                            n as u64,
-                            p50 as u64,
-                            p95 as u64,
-                            p99 as u64,
-                            errors,
-                            errors * 1_000_000 / n as u64,
-                        ] {
+                        for value in [n, p50, p95, p99, errors, errors * 1_000_000 / n] {
                             text.push(b' ');
                             push_num(&mut text, value);
                         }
