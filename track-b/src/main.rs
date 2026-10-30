@@ -221,13 +221,13 @@ impl Phrases {
     }
 }
 
-/// Counting sort of (key, doc) pairs from chunks in document order: each key's docs end up
-/// contiguous and ascending. Returns the start offset of every key and the docs.
-fn group_by_key(chunks: &[Vec<(u32, u32)>], keys: usize) -> (Vec<usize>, Vec<u32>) {
+/// Counting sort of (key, doc) pairs, keys in `lo..lo + keys`, from chunks in document order:
+/// each key's docs end up contiguous and ascending. Returns every key's start offset and the docs.
+fn group_by_key(chunks: &[&[(u32, u32)]], lo: usize, keys: usize) -> (Vec<usize>, Vec<u32>) {
     let mut starts = vec![0usize; keys + 1];
     for chunk in chunks {
-        for &(k, _) in chunk {
-            starts[k as usize + 1] += 1;
+        for &(k, _) in chunk.iter() {
+            starts[k as usize - lo + 1] += 1;
         }
     }
     for k in 0..keys {
@@ -236,9 +236,9 @@ fn group_by_key(chunks: &[Vec<(u32, u32)>], keys: usize) -> (Vec<usize>, Vec<u32
     let mut fill = starts.clone();
     let mut docs = vec![0u32; starts[keys]];
     for chunk in chunks {
-        for &(k, d) in chunk {
-            docs[fill[k as usize]] = d;
-            fill[k as usize] += 1;
+        for &(k, d) in chunk.iter() {
+            docs[fill[k as usize - lo]] = d;
+            fill[k as usize - lo] += 1;
         }
     }
     (starts, docs)
@@ -307,67 +307,89 @@ fn main() {
     let docs = map_file(&format!("{data_dir}/docs.txt"));
     let chunks = split_lines(docs, threads * 16);
     let next = AtomicUsize::new(0);
-    let mut results: Vec<(usize, Vec<(u32, u32)>, Vec<(u32, u32)>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut done = Vec::new();
-                    let mut last_doc = vec![u32::MAX; term_count];
-                    let mut last_match = vec![u32::MAX; states];
-                    let mut buf = Vec::new();
-                    loop {
-                        let c = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(chunk) = chunks.get(c) else { break };
-                        let (mut postings, mut matches) = (Vec::new(), Vec::new());
-                        let mut p = 0;
-                        while p < chunk.len() {
-                            let tab = p + chunk[p..].iter().position(|&b| b == b'\t').unwrap();
-                            let end = tab + chunk[tab..].iter().position(|&b| b == b'\n').unwrap();
-                            let doc = chunk[p..tab]
-                                .iter()
-                                .fold(0u32, |acc, &b| acc * 10 + (b - b'0') as u32);
-                            let mut state = 0;
-                            tokens(&chunk[tab + 1..end], &mut buf, |token| {
-                                let Some(&t) = terms.get(token) else {
-                                    state = 0; // no phrase contains a word that is not a query term
-                                    return;
-                                };
-                                if in_bool[t as usize] && last_doc[t as usize] != doc {
-                                    last_doc[t as usize] = doc;
-                                    postings.push((t, doc));
-                                }
-                                state = automaton.step(state, t);
-                                let mut hit = automaton.out[state as usize];
-                                while hit != u32::MAX {
-                                    if last_match[hit as usize] != doc {
-                                        last_match[hit as usize] = doc;
-                                        matches.push((hit, doc));
+    let mut results: Vec<(usize, Vec<Vec<(u32, u32)>>, Vec<(u32, u32)>)> =
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let mut done = Vec::new();
+                        let mut last_doc = vec![u32::MAX; term_count];
+                        let mut last_match = vec![u32::MAX; states];
+                        let mut buf = Vec::new();
+                        loop {
+                            let c = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(chunk) = chunks.get(c) else { break };
+                            // Postings are filed by term range, one range per thread for the sort.
+                            let (mut postings, mut matches) =
+                                (vec![Vec::new(); threads], Vec::new());
+                            let mut p = 0;
+                            while p < chunk.len() {
+                                let tab = p + chunk[p..].iter().position(|&b| b == b'\t').unwrap();
+                                let end =
+                                    tab + chunk[tab..].iter().position(|&b| b == b'\n').unwrap();
+                                let doc = chunk[p..tab]
+                                    .iter()
+                                    .fold(0u32, |acc, &b| acc * 10 + (b - b'0') as u32);
+                                let mut state = 0;
+                                tokens(&chunk[tab + 1..end], &mut buf, |token| {
+                                    let Some(&t) = terms.get(token) else {
+                                        state = 0; // no phrase contains a word that is not a query term
+                                        return;
+                                    };
+                                    if in_bool[t as usize] && last_doc[t as usize] != doc {
+                                        last_doc[t as usize] = doc;
+                                        postings[t as usize * threads / term_count].push((t, doc));
                                     }
-                                    hit = automaton.out[automaton.fail[hit as usize] as usize];
-                                }
-                            });
-                            p = end + 1;
+                                    state = automaton.step(state, t);
+                                    let mut hit = automaton.out[state as usize];
+                                    while hit != u32::MAX {
+                                        if last_match[hit as usize] != doc {
+                                            last_match[hit as usize] = doc;
+                                            matches.push((hit, doc));
+                                        }
+                                        hit = automaton.out[automaton.fail[hit as usize] as usize];
+                                    }
+                                });
+                                p = end + 1;
+                            }
+                            done.push((c, postings, matches));
                         }
-                        done.push((c, postings, matches));
-                    }
-                    done
+                        done
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect()
+        });
+    results.sort_unstable_by_key(|r| r.0);
+
+    // 3. Counting sorts, in chunk order, so every list is ascending. Thread k sorts the terms
+    //    `first(k)..first(k + 1)`, which is exactly what the scan filed under k.
+    let (postings, matches): (Vec<_>, Vec<_>) = results.into_iter().map(|(_, p, m)| (p, m)).unzip();
+    let first = |k: usize| (k * term_count).div_ceil(threads);
+    let groups: Vec<(Vec<usize>, Vec<u32>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|k| {
+                let (postings, first) = (&postings, &first);
+                scope.spawn(move || {
+                    let lists: Vec<&[(u32, u32)]> =
+                        postings.iter().map(|chunk| &chunk[k][..]).collect();
+                    group_by_key(&lists, first(k), first(k + 1) - first(k))
                 })
             })
             .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap())
-            .collect()
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
-    results.sort_unstable_by_key(|r| r.0);
-
-    // 3. Counting sorts, in chunk order, so every list is ascending.
-    let (postings, matches): (Vec<_>, Vec<_>) = results.into_iter().map(|(_, p, m)| (p, m)).unzip();
-    let (term_start, term_docs) = group_by_key(&postings, term_count);
     drop(postings);
-    let (state_start, state_docs) = group_by_key(&matches, states);
-    drop(matches);
-    let list = |t: u32| &term_docs[term_start[t as usize]..term_start[t as usize + 1]];
+    let matches: Vec<&[(u32, u32)]> = matches.iter().map(|m| &m[..]).collect();
+    let (state_start, state_docs) = group_by_key(&matches, 0, states);
+    let list = |t: u32| {
+        let k = t as usize * threads / term_count;
+        let (starts, docs) = &groups[k];
+        &docs[starts[t as usize - first(k)]..starts[t as usize - first(k) + 1]]
+    };
 
     // 4. Answer the queries in parallel, in contiguous ranges so the output stays in order.
     let parts: Vec<Vec<u8>> = std::thread::scope(|scope| {
