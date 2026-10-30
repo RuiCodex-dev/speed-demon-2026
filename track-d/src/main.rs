@@ -8,7 +8,8 @@
 //!    renumbered CSR, after the first one has been freed.
 //! 3. Answer the queries in parallel, one Dijkstra per query with a radix heap, stopping when the
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
-//!    Each thread keeps one distance array and resets only the nodes the last search touched.
+//!    Distances live in 1024-node pages taken from a per-thread pool, so a thread holds only the
+//!    pages its current search touched.
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
@@ -100,36 +101,79 @@ impl RadixHeap {
     }
 }
 
+/// Entries per page of `Dist`.
+const PAGE: usize = 1024;
+
+/// Tentative distances (+ 1, so 0 means "not reached") in pages of `PAGE` nodes. A page is taken
+/// from the pool when first written and returned, zeroed, when the search ends, so a thread holds
+/// only the pages its current search touched. Pool page 0 stays all zero and stands for every page
+/// not in use.
+struct Dist<T> {
+    page: Vec<u32>,
+    pool: Vec<T>,
+    free: Vec<u32>,
+    used: Vec<u32>,
+}
+
+impl<T: Copy + Default> Dist<T> {
+    fn new(n: usize) -> Self {
+        Dist {
+            page: vec![0; n.div_ceil(PAGE)],
+            pool: vec![T::default(); PAGE],
+            free: Vec::new(),
+            used: Vec::new(),
+        }
+    }
+    fn get(&self, v: u32) -> T {
+        self.pool[self.page[v as usize / PAGE] as usize * PAGE + v as usize % PAGE]
+    }
+    fn set(&mut self, v: u32, d: T) {
+        let p = v as usize / PAGE;
+        if self.page[p] == 0 {
+            self.page[p] = match self.free.pop() {
+                Some(slot) => slot,
+                None => {
+                    self.pool.resize(self.pool.len() + PAGE, T::default());
+                    (self.pool.len() / PAGE - 1) as u32
+                }
+            };
+            self.used.push(p as u32);
+        }
+        self.pool[self.page[p] as usize * PAGE + v as usize % PAGE] = d;
+    }
+    fn reset(&mut self) {
+        for p in self.used.drain(..) {
+            let slot = std::mem::take(&mut self.page[p as usize]);
+            self.pool[slot as usize * PAGE..][..PAGE].fill(T::default());
+            self.free.push(slot);
+        }
+    }
+}
+
 /// Shortest distance from `s` to `t`: Ok(None) if `t` is unreachable, Err(()) if a distance did not
-/// fit in `T`. `dist[v]` holds v's tentative distance + 1, so 0 means "not reached": the arrays can
-/// come zeroed from calloc, and only the entries a search touched are reset afterwards.
+/// fit in `T`.
 fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
     offsets: &[u32],
     edges: &[(u32, u32)],
     (s, t): (u32, u32),
-    dist: &mut [T],
-    touched: &mut Vec<u32>,
+    dist: &mut Dist<T>,
     heap: &mut RadixHeap,
 ) -> Result<Option<u64>, ()> {
     let mut search = || {
-        dist[s as usize] = T::try_from(1).map_err(|_| ())?;
-        touched.push(s);
+        dist.set(s, T::try_from(1).map_err(|_| ())?);
         heap.push(0, s);
         while let Some((d, u)) = heap.pop() {
             if u == t {
                 return Ok(Some(d));
             }
-            if d + 1 > dist[u as usize].into() {
+            if d + 1 > dist.get(u).into() {
                 continue; // stale entry: u was already settled closer
             }
             for &(v, w) in &edges[offsets[u as usize] as usize..offsets[u as usize + 1] as usize] {
                 let nd = d + w as u64;
-                let old = dist[v as usize];
+                let old = dist.get(v);
                 if old == T::default() || nd + 1 < old.into() {
-                    if old == T::default() {
-                        touched.push(v);
-                    }
-                    dist[v as usize] = T::try_from(nd + 1).map_err(|_| ())?;
+                    dist.set(v, T::try_from(nd + 1).map_err(|_| ())?);
                     heap.push(nd, v);
                 }
             }
@@ -137,10 +181,7 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
         Ok(None)
     };
     let answer = search();
-    for &v in touched.iter() {
-        dist[v as usize] = T::default();
-    }
-    touched.clear();
+    dist.reset();
     heap.clear();
     answer
 }
@@ -345,7 +386,7 @@ fn main() {
             scope.spawn(|| {
                 // u32 distances halve the per-thread array; a search that overflows them (only the
                 // spec's near-2^32 weights do) is repeated with a u64 array made on first need.
-                let (mut dist, mut wide, mut touched) = (vec![0u32; n], Vec::new(), Vec::new());
+                let (mut dist, mut wide) = (Dist::<u32>::new(n), None);
                 let mut heap = RadixHeap {
                     buckets: vec![Vec::new(); 65],
                     last: 0,
@@ -359,20 +400,10 @@ fn main() {
                     }
                     let query = (rank[s as usize], rank[t as usize]);
                     let answer =
-                        shortest(&offsets, &edges, query, &mut dist, &mut touched, &mut heap)
-                            .or_else(|_| {
-                                if wide.is_empty() {
-                                    wide = vec![0u64; n];
-                                }
-                                shortest(
-                                    &offsets,
-                                    &edges,
-                                    query,
-                                    &mut wide,
-                                    &mut touched,
-                                    &mut heap,
-                                )
-                            });
+                        shortest(&offsets, &edges, query, &mut dist, &mut heap).or_else(|_| {
+                            let wide = wide.get_or_insert_with(|| Dist::<u64>::new(n));
+                            shortest(&offsets, &edges, query, wide, &mut heap)
+                        });
                     if let Ok(Some(d)) = answer {
                         answers[i].store(d, Ordering::Relaxed);
                     }
