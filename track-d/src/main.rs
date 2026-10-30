@@ -335,6 +335,10 @@ fn main() {
         ));
     }
     let answers: Vec<AtomicU64> = (0..list.len()).map(|_| AtomicU64::new(u64::MAX)).collect();
+    // Queries are taken in order of their source's new id, so the threads search neighbouring
+    // regions at the same time and share the graph in the last-level cache.
+    let mut by_source: Vec<usize> = (0..list.len()).collect();
+    by_source.sort_unstable_by_key(|&i| rank[list[i].0 as usize]);
     let next = AtomicU32::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads.min(list.len()) {
@@ -347,8 +351,8 @@ fn main() {
                     last: 0,
                 };
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed) as usize;
-                    let Some(&(s, t)) = list.get(i) else { break };
+                    let Some(&i) = by_source.get(next.fetch_add(1, Ordering::Relaxed) as usize) else { break };
+                    let (s, t) = list[i];
                     let reachable = s == t || has_in[t as usize / 64] >> (t % 64) & 1 == 1;
                     if !reachable {
                         continue;
