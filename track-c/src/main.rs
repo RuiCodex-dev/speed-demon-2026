@@ -149,8 +149,13 @@ impl Names {
         }
     }
 
-    fn id(&self, name: &[u8]) -> usize {
-        let h = hash(name);
+    /// Starts loading the slot where a lookup of a name with hash `h` begins.
+    fn prefetch(&self, h: u64) {
+        prefetch(&self.slots[h as usize & (self.slots.len() - 1)]);
+    }
+
+    /// The id of `name`, whose hash is `h`.
+    fn id(&self, name: &[u8], h: u64) -> usize {
         let len = u16::try_from(name.len()).expect("name longer than 64 KiB");
         let (tag, mask) = (h >> 54, self.slots.len() - 1);
         let mut i = h as usize & mask;
@@ -248,47 +253,84 @@ fn parse<C: Copy + Into<u16>>(
     seen: &[AtomicU64],
     words: usize,
 ) {
+    // Two records are in flight: the next one is parsed and the cache lines its lookups will need
+    // are requested while the previous one is counted, so the two misses overlap with work.
+    let mut pending: Option<Record> = None;
     let mut p = start;
-    while p < end {
-        if data[p..].starts_with(BOM) {
-            p += BOM.len();
-        }
-        let id = integer(data, &mut p);
-        p += 1;
-        let (name, name_escapes) = text_field(data, &mut p);
-        p += 1;
-        let (note, note_escapes) = text_field(data, &mut p);
-        p += 1;
-        let region = integer(data, &mut p) as usize;
-        p += 1;
-        let negative = data[p] == b'-';
-        p += negative as usize;
-        let whole = integer(data, &mut p) as i64;
-        let cents = whole * 100 + ((data[p + 1] - b'0') * 10 + (data[p + 2] - b'0')) as i64;
-        let amount = if negative { -cents } else { cents };
-        p += 3;
-        p += if data.get(p) == Some(&b'\r') { 2 } else { 1 };
-
-        let country = country_of.get(region).map_or(unmatched, |&c| c.into());
-        let t = &mut totals[country as usize];
-        t.count += 1;
-        t.id_sum += id;
-        t.amount_sum += amount;
-        t.amount_min = t.amount_min.min(amount);
-        t.amount_max = t.amount_max.max(amount);
-        t.name_bytes += (name.len() - name_escapes) as u64;
-        t.note_bytes += (note.len() - note_escapes) as u64;
-        let name_id = if name_escapes == 0 {
-            names.id(name)
-        } else {
-            {
-                let (copy, len) = unescape(name);
-                names.id(&copy[..len])
+    loop {
+        let next = (p < end).then(|| {
+            if data[p..].starts_with(BOM) {
+                p += BOM.len();
             }
-        };
-        seen[country as usize * words + name_id / 64]
-            .fetch_or(1 << (name_id % 64), Ordering::Relaxed);
+            let id = integer(data, &mut p);
+            p += 1;
+            let (raw, name_escapes) = text_field(data, &mut p);
+            p += 1;
+            let (note, note_escapes) = text_field(data, &mut p);
+            p += 1;
+            let region = integer(data, &mut p) as usize;
+            p += 1;
+            let negative = data[p] == b'-';
+            p += negative as usize;
+            let whole = integer(data, &mut p) as i64;
+            let cents = whole * 100 + ((data[p + 1] - b'0') * 10 + (data[p + 2] - b'0')) as i64;
+            p += 3;
+            p += if data.get(p) == Some(&b'\r') { 2 } else { 1 };
+            let copy = if name_escapes == 0 { (Vec::new(), raw.len()) } else { unescape(raw) };
+            let h = hash(if name_escapes == 0 { raw } else { &copy.0[..copy.1] });
+            names.prefetch(h);
+            if let Some(c) = country_of.get(region) {
+                prefetch(c);
+            }
+            Record {
+                id,
+                amount: if negative { -cents } else { cents },
+                region,
+                raw,
+                copy,
+                h,
+                note_bytes: (note.len() - note_escapes) as u64,
+            }
+        });
+        if let Some(r) = pending.take() {
+            let country = country_of.get(r.region).map_or(unmatched, |&c| c.into());
+            let t = &mut totals[country as usize];
+            t.count += 1;
+            t.id_sum += r.id;
+            t.amount_sum += r.amount;
+            t.amount_min = t.amount_min.min(r.amount);
+            t.amount_max = t.amount_max.max(r.amount);
+            t.name_bytes += r.copy.1 as u64;
+            t.note_bytes += r.note_bytes;
+            let name = if r.copy.0.is_empty() { r.raw } else { &r.copy.0[..r.copy.1] };
+            let name_id = names.id(name, r.h);
+            seen[country as usize * words + name_id / 64]
+                .fetch_or(1 << (name_id % 64), Ordering::Relaxed);
+        }
+        match next {
+            Some(r) => pending = Some(r),
+            None => break,
+        }
     }
+}
+
+/// A parsed record waiting for its lookups.
+struct Record {
+    id: u64,
+    amount: i64,
+    region: usize,
+    /// The name as it appears in the file, and its unescaped copy (empty if it had no `""`) with
+    /// the unescaped length.
+    raw: &'static [u8],
+    copy: (Vec<u8>, usize),
+    h: u64,
+    note_bytes: u64,
+}
+
+/// Asks for the cache line holding `x`; never faults.
+fn prefetch<T>(x: &T) {
+    // SAFETY: a prefetch has no architectural effect.
+    unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(x as *const T as *const i8) };
 }
 
 fn push_num(out: &mut Vec<u8>, mut value: u64) {
