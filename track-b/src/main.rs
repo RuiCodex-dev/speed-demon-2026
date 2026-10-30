@@ -469,13 +469,11 @@ fn main() {
         }
     }
     let term_count = terms.len();
-    let mut words = vec![&b""[..]; term_count];
+    let mut term_words = vec![&b""[..]; term_count];
     for (&word, &id) in &terms {
-        words[id as usize] = word;
+        term_words[id as usize] = word;
     }
-    let vocab = Vocab::new(&words);
-    let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
-    let states = automaton.fail.len();
+    let vocab = Vocab::new(&term_words);
 
     // 2. Frequent BOOL terms get a bitmap over all documents instead of a posting list. A sample of
     //    about 1/64 of the corpus, spread over the file, estimates each term's document frequency;
@@ -498,7 +496,7 @@ fn main() {
     let samples: Vec<(u32, Vec<u32>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|k| {
-                let (vocab, in_bool) = (&vocab, &in_bool);
+                let vocab = &vocab;
                 scope.spawn(move || {
                     let start = line_start(docs, docs.len() * k / threads);
                     let end = line_start(docs, start + docs.len() / threads / 64);
@@ -509,7 +507,7 @@ fn main() {
                         tokens(text, |token, h| {
                             if let Some(t) = vocab
                                 .get(token, h)
-                                .filter(|&t| in_bool[t as usize] && last[t as usize] != doc)
+                                .filter(|&t| last[t as usize] != doc)
                             {
                                 last[t as usize] = doc;
                                 df[t as usize] += 1;
@@ -523,11 +521,39 @@ fn main() {
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
     let sampled_docs: u32 = samples.iter().map(|s| s.0).sum();
+    // Renumber the terms by sampled document frequency, so the per-term tables of the scan keep
+    // the frequent terms together in a few cache lines.
+    let df: Vec<u32> = (0..term_count)
+        .map(|t| samples.iter().map(|s| s.1[t]).sum())
+        .collect();
+    let mut order: Vec<u32> = (0..term_count as u32).collect();
+    order.sort_by_key(|&t| std::cmp::Reverse(df[t as usize]));
+    let mut new_id = vec![0; term_count];
+    for (n, &t) in order.iter().enumerate() {
+        new_id[t as usize] = n as u32;
+    }
+    let pick = |t: &u32| *t as usize;
+    let term_words: Vec<&[u8]> = order.iter().map(|t| term_words[pick(t)]).collect();
+    let in_bool: Vec<bool> = order.iter().map(|t| in_bool[pick(t)]).collect();
+    let df: Vec<u32> = order.iter().map(|t| df[pick(t)]).collect();
+    for phrase in &mut phrases {
+        phrase.iter_mut().for_each(|t| *t = new_id[*t as usize]);
+    }
+    for query in &mut queries {
+        if let Query::Bool(first, ops) = query {
+            *first = new_id[*first as usize];
+            ops.iter_mut().for_each(|(_, t)| *t = new_id[*t as usize]);
+        }
+    }
+    drop(vocab);
+    let vocab = Vocab::new(&term_words);
+    let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
+    let states = automaton.fail.len();
     let mut dense = vec![u32::MAX; term_count];
     let mut dense_count = 0;
     for t in 0..term_count {
         // A bitmap costs doc_count / 8 bytes; a posting costs 4 bytes, and 8 while it is collected.
-        if samples.iter().map(|s| s.1[t]).sum::<u32>() * 64 >= sampled_docs.max(1) {
+        if in_bool[t] && df[t] * 64 >= sampled_docs.max(1) {
             dense[t] = dense_count;
             dense_count += 1;
         }
