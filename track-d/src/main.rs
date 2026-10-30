@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
 }
 
 /// Maps a whole file read-only for the life of the process.
@@ -188,9 +187,6 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
 }
 
 fn main() {
-    // SAFETY: plain libc call. PR_SET_THP_DISABLE: transparent huge pages would back sparsely
-    // touched regions with whole 2 MB pages.
-    unsafe { prctl(41, 1, 0, 0, 0) };
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());

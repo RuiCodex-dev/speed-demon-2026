@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
-    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
 }
 
@@ -430,9 +429,6 @@ fn line_start(data: &[u8], mut pos: usize) -> usize {
 const NEWLINE: u8 = 10;
 
 fn main() {
-    // SAFETY: plain libc call. PR_SET_THP_DISABLE: transparent huge pages would back sparsely
-    // touched regions with whole 2 MB pages.
-    unsafe { prctl(41, 1, 0, 0, 0) };
     // SAFETY: plain libc call. M_MMAP_THRESHOLD = 128 KB, fixed: glibc otherwise raises it after a
     // large block is freed, and later large blocks then come from the heap and stay resident.
     unsafe { mallopt(-3, 1 << 17) };
