@@ -324,13 +324,19 @@ impl Phrases {
     }
 }
 
-/// Counting sort of (key, doc) pairs, keys in `lo..lo + keys`, from chunks in document order:
-/// each key's docs end up contiguous and ascending. Returns every key's start offset and the docs.
-fn group_by_key(chunks: &[&[(u32, u32)]], lo: usize, keys: usize) -> (Vec<usize>, Vec<u32>) {
+/// Counting sort of packed postings, `key << shift | (doc - base)` with keys in `lo..lo + keys`,
+/// from chunks given in document order with their base document: each key's docs end up contiguous
+/// and ascending. Returns every key's start offset and the docs.
+fn group_by_key(
+    chunks: &[(&[u32], u32)],
+    lo: usize,
+    keys: usize,
+    shift: u32,
+) -> (Vec<usize>, Vec<u32>) {
     let mut starts = vec![0usize; keys + 1];
-    for chunk in chunks {
-        for &(k, _) in chunk.iter() {
-            starts[k as usize - lo + 1] += 1;
+    for (chunk, _) in chunks {
+        for &p in chunk.iter() {
+            starts[(p >> shift) as usize - lo + 1] += 1;
         }
     }
     for k in 0..keys {
@@ -338,13 +344,39 @@ fn group_by_key(chunks: &[&[(u32, u32)]], lo: usize, keys: usize) -> (Vec<usize>
     }
     let mut fill = starts.clone();
     let mut docs = vec![0u32; starts[keys]];
-    for chunk in chunks {
-        for &(k, d) in chunk.iter() {
-            docs[fill[k as usize - lo]] = d;
-            fill[k as usize - lo] += 1;
+    for &(chunk, base) in chunks {
+        for &p in chunk.iter() {
+            let k = (p >> shift) as usize - lo;
+            docs[fill[k]] = base + (p & ((1 << shift) - 1));
+            fill[k] += 1;
         }
     }
     (starts, docs)
+}
+
+/// The id of the document on the first line of `lines`.
+fn first_id(lines: &[u8]) -> u32 {
+    lines
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .fold(0, |a, &b| a * 10 + (b - b'0') as u32)
+}
+
+/// Splits chunks of whole lines further until each spans fewer than `limit` document ids.
+fn limit_span<'a>(chunks: Vec<&'a [u8]>, limit: u32) -> Vec<&'a [u8]> {
+    let mut out = Vec::new();
+    for chunk in chunks {
+        let last = chunk[..chunk.len() - 1]
+            .iter()
+            .rposition(|&b| b == NEWLINE)
+            .map_or(0, |i| i + 1);
+        if first_id(&chunk[last..]) - first_id(chunk) < limit || last == 0 {
+            out.push(chunk);
+        } else {
+            out.extend(limit_span(split_lines(chunk, 2), limit));
+        }
+    }
+    out
 }
 
 fn push_num(out: &mut Vec<u8>, mut value: u64) {
@@ -486,8 +518,8 @@ fn main() {
     let mut dense = vec![u32::MAX; term_count];
     let mut dense_count = 0;
     for t in 0..term_count {
-        // A bitmap costs doc_count / 8 bytes; a posting list costs 4 bytes per document.
-        if samples.iter().map(|s| s.1[t]).sum::<u32>() * 32 >= sampled_docs.max(1) {
+        // A bitmap costs doc_count / 8 bytes; a posting costs 4 bytes, and 8 while it is collected.
+        if samples.iter().map(|s| s.1[t]).sum::<u32>() * 64 >= sampled_docs.max(1) {
             dense[t] = dense_count;
             dense_count += 1;
         }
@@ -498,103 +530,119 @@ fn main() {
 
     // 3. Parallel corpus scan: bitmap bits or postings for BOOL terms, and phrase matches, each
     //    once per document.
-    let chunks = split_lines(docs, threads * 16);
+    // Postings and phrase matches are packed as `key << shift | (doc - first doc of the chunk)` in a
+    // u32, so every chunk must span fewer document ids than the bits left over allow.
+    let bits = |keys: usize| usize::BITS - keys.leading_zeros();
+    let (term_shift, state_shift) = (32 - bits(term_count), 32 - bits(states));
+    assert!(
+        term_shift.min(state_shift) >= 8,
+        "too many query terms to pack postings"
+    );
+    let chunks = limit_span(
+        split_lines(docs, threads * 16),
+        1 << term_shift.min(state_shift),
+    );
     let next = AtomicUsize::new(0);
-    let mut results: Vec<(usize, Vec<Vec<(u32, u32)>>, Vec<(u32, u32)>)> =
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut done = Vec::new();
-                        let mut last_doc = vec![u32::MAX; term_count];
-                        let mut last_match = vec![u32::MAX; states];
-                        loop {
-                            let c = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(chunk) = chunks.get(c) else { break };
-                            // Postings are filed by term range, one range per thread for the sort.
-                            let (mut postings, mut matches) =
-                                (vec![Vec::new(); threads], Vec::new());
-                            // Bits for frequent terms go to a bitmap local to this chunk's documents
-                            // and are merged with one atomic OR per word at the end.
-                            let id = |line: &[u8]| {
-                                line.iter()
-                                    .take_while(|b| b.is_ascii_digit())
-                                    .fold(0, |a, &b| a * 10 + (b - b'0') as usize)
-                            };
-                            let last = chunk[..chunk.len() - 1]
-                                .iter()
-                                .rposition(|&b| b == NEWLINE)
-                                .map_or(0, |i| i + 1);
-                            let (base, span) =
-                                (id(chunk) / 64, id(&chunk[last..]) / 64 + 1 - id(chunk) / 64);
-                            let mut local = vec![0u64; dense_count as usize * span];
-                            for_each_doc(chunk, |doc, text| {
-                                let mut state = 0;
-                                tokens(text, |token, h| {
-                                    let Some(t) = vocab.get(token, h) else {
-                                        state = 0; // no phrase contains a word that is not a query term
-                                        return;
-                                    };
-                                    if in_bool[t as usize] && last_doc[t as usize] != doc {
-                                        last_doc[t as usize] = doc;
-                                        match dense[t as usize] {
-                                            u32::MAX => postings[t as usize * threads / term_count]
-                                                .push((t, doc)),
-                                            d => {
-                                                local[d as usize * span + doc as usize / 64
-                                                    - base] |= 1 << (doc % 64)
-                                            }
+    let mut results: Vec<(usize, u32, Vec<Vec<u32>>, Vec<u32>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    let mut last_doc = vec![u32::MAX; term_count];
+                    let mut last_match = vec![u32::MAX; states];
+                    loop {
+                        let c = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(chunk) = chunks.get(c) else { break };
+                        // Postings are filed by term range, one range per thread for the sort.
+                        let (mut postings, mut matches) = (vec![Vec::new(); threads], Vec::new());
+                        // Bits for frequent terms go to a bitmap local to this chunk's documents
+                        // and are merged with one atomic OR per word at the end.
+                        let last = chunk[..chunk.len() - 1]
+                            .iter()
+                            .rposition(|&b| b == NEWLINE)
+                            .map_or(0, |i| i + 1);
+                        let first_doc = first_id(chunk);
+                        let (base, span) = (
+                            first_doc as usize / 64,
+                            first_id(&chunk[last..]) as usize / 64 + 1 - first_doc as usize / 64,
+                        );
+                        let mut local = vec![0u64; dense_count as usize * span];
+                        for_each_doc(chunk, |doc, text| {
+                            let mut state = 0;
+                            tokens(text, |token, h| {
+                                let Some(t) = vocab.get(token, h) else {
+                                    state = 0; // no phrase contains a word that is not a query term
+                                    return;
+                                };
+                                if in_bool[t as usize] && last_doc[t as usize] != doc {
+                                    last_doc[t as usize] = doc;
+                                    match dense[t as usize] {
+                                        u32::MAX => postings[t as usize * threads / term_count]
+                                            .push(t << term_shift | (doc - first_doc)),
+                                        d => {
+                                            local[d as usize * span + doc as usize / 64 - base] |=
+                                                1 << (doc % 64)
                                         }
                                     }
-                                    state = automaton.step(state, t);
-                                    let mut hit = automaton.out[state as usize];
-                                    while hit != u32::MAX {
-                                        if last_match[hit as usize] != doc {
-                                            last_match[hit as usize] = doc;
-                                            matches.push((hit, doc));
-                                        }
-                                        hit = automaton.out[automaton.fail[hit as usize] as usize];
+                                }
+                                state = automaton.step(state, t);
+                                let mut hit = automaton.out[state as usize];
+                                while hit != u32::MAX {
+                                    if last_match[hit as usize] != doc {
+                                        last_match[hit as usize] = doc;
+                                        matches.push(hit << state_shift | (doc - first_doc));
                                     }
-                                });
+                                    hit = automaton.out[automaton.fail[hit as usize] as usize];
+                                }
                             });
-                            for (i, &bits) in local.iter().enumerate().filter(|(_, b)| **b != 0) {
-                                bitmaps[i / span * words + base + i % span]
-                                    .fetch_or(bits, Ordering::Relaxed);
-                            }
-                            done.push((c, postings, matches));
+                        });
+                        for (i, &bits) in local.iter().enumerate().filter(|(_, b)| **b != 0) {
+                            bitmaps[i / span * words + base + i % span]
+                                .fetch_or(bits, Ordering::Relaxed);
                         }
-                        done
-                    })
+                        done.push((c, first_doc, postings, matches));
+                    }
+                    done
                 })
-                .collect();
-            workers
-                .into_iter()
-                .flat_map(|w| w.join().unwrap())
-                .collect()
-        });
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect()
+    });
     results.sort_unstable_by_key(|r| r.0);
     let bitmaps: Vec<u64> = bitmaps.into_iter().map(AtomicU64::into_inner).collect();
 
     // 4. Counting sorts, in chunk order, so every list is ascending. Thread k sorts the terms
     //    `first(k)..first(k + 1)`, which is exactly what the scan filed under k.
-    let (postings, matches): (Vec<_>, Vec<_>) = results.into_iter().map(|(_, p, m)| (p, m)).unzip();
+    let bases: Vec<u32> = results.iter().map(|r| r.1).collect();
+    let (postings, matches): (Vec<_>, Vec<_>) =
+        results.into_iter().map(|(_, _, p, m)| (p, m)).unzip();
     let first = |k: usize| (k * term_count).div_ceil(threads);
     let groups: Vec<(Vec<usize>, Vec<u32>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|k| {
-                let (postings, first) = (&postings, &first);
+                let (postings, first, bases) = (&postings, &first, &bases);
                 scope.spawn(move || {
-                    let lists: Vec<&[(u32, u32)]> =
-                        postings.iter().map(|chunk| &chunk[k][..]).collect();
-                    group_by_key(&lists, first(k), first(k + 1) - first(k))
+                    let lists: Vec<(&[u32], u32)> = postings
+                        .iter()
+                        .zip(bases)
+                        .map(|(chunk, &b)| (&chunk[k][..], b))
+                        .collect();
+                    group_by_key(&lists, first(k), first(k + 1) - first(k), term_shift)
                 })
             })
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
     drop(postings);
-    let matches: Vec<&[(u32, u32)]> = matches.iter().map(|m| &m[..]).collect();
-    let (state_start, state_docs) = group_by_key(&matches, 0, states);
+    let matches: Vec<(&[u32], u32)> = matches
+        .iter()
+        .zip(&bases)
+        .map(|(m, &b)| (&m[..], b))
+        .collect();
+    let (state_start, state_docs) = group_by_key(&matches, 0, states, state_shift);
     let list = |t: u32| {
         let k = t as usize * threads / term_count;
         let (starts, docs) = &groups[k];
