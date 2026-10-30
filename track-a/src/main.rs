@@ -1,17 +1,16 @@
 //! Speed Demon 2026, Track A (Ingest).
 //!
-//! 1. Map `requests.log` and parse it in parallel chunks. Each thread interns endpoints into its
-//!    own table and appends one packed `u64` record per line: hour, endpoint, 5xx flag, latency.
+//! 1. Map `requests.log` and cut it into one chunk per thread. Each thread interns endpoints into
+//!    its own table and appends one packed `u64` per line: hour, endpoint, 5xx flag, latency.
 //! 2. Merge the endpoint tables into one sorted list, so that a group id
-//!    `(hour - first_hour) * endpoints + endpoint_rank` is already in output order.
-//! 3. Counting sort: per-thread group counts give every thread its own slots, then each thread
-//!    scatters its latencies into one array where every group is contiguous.
-//! 4. Nearest-rank percentiles with `select_nth_unstable` (no full sort), formatted in parallel.
+//!    `(hour - first_hour) * endpoints + endpoint_rank` is already the output order.
+//! 3. Each thread rewrites its records in place as `group << 33 | 5xx << 32 | latency` and sorts
+//!    them, so every group is one contiguous run per chunk. No other per-line array is allocated.
+//! 4. Groups are formatted in parallel ranges: a group's runs are gathered from every chunk into a
+//!    small scratch buffer and the nearest-rank percentiles come from `select_nth_unstable`.
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -83,7 +82,7 @@ fn hour_of(ts: &[u8]) -> i64 {
         + digits(&ts[11..13])
 }
 
-// Record layout: latency in bits 0-31, thread-local endpoint id in 32-47, the 5xx flag in bit 48,
+// Parse layout: latency in bits 0-31, thread-local endpoint id in 32-47, the 5xx flag in bit 48,
 // and the hour relative to the first line's hour, biased by HOUR_BIAS, in bits 49-63.
 const HOUR_BIAS: i64 = 1 << 14;
 
@@ -92,12 +91,13 @@ struct Shard {
     records: Vec<u64>,
 }
 
-fn parse(
-    chunk: &'static [u8],
-    base_hour: i64,
-    shard: &mut Shard,
-    ids: &mut HashMap<&'static [u8], u16, BuildHasherDefault<Fx>>,
-) {
+fn parse(chunk: &'static [u8], base_hour: i64) -> Shard {
+    // Lines are 40 to 160 bytes and about 77 on average; grow only if this guess is low.
+    let mut shard = Shard {
+        endpoints: Vec::new(),
+        records: Vec::with_capacity(chunk.len() / 70),
+    };
+    let mut ids: HashMap<&[u8], u16, BuildHasherDefault<Fx>> = HashMap::default();
     let (mut p, mut last_prefix, mut hour_bits) = (0, &chunk[..0], 0u64);
     while p < chunk.len() {
         let line = &chunk[p..];
@@ -137,6 +137,7 @@ fn parse(
             .push(hour_bits | error << 48 | (id as u64) << 32 | latency);
         p += k + 1;
     }
+    shard
 }
 
 /// Splits `data` into about `parts` pieces that each end with a newline.
@@ -155,12 +156,6 @@ fn split_lines(data: &'static [u8], parts: usize) -> Vec<&'static [u8]> {
     }
     chunks
 }
-
-#[derive(Clone, Copy)]
-struct SharedPtr(*mut u32);
-// SAFETY: every thread writes a disjoint set of indices (its own counting-sort slots).
-unsafe impl Send for SharedPtr {}
-unsafe impl Sync for SharedPtr {}
 
 fn push_num(out: &mut Vec<u8>, mut value: u64) {
     let mut buf = [0u8; 20];
@@ -189,24 +184,12 @@ fn main() {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     let base_hour = hour_of(data);
 
-    // Phase 1: parse. Threads pull chunks from a shared counter so that they finish together.
-    let chunks = split_lines(data, threads * 16);
-    let next = AtomicUsize::new(0);
+    // Phase 1: parse, one chunk per thread (lines are uniform, so equal byte ranges balance).
+    let chunks = split_lines(data, threads);
     let mut shards: Vec<Shard> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut shard = Shard {
-                        endpoints: Vec::new(),
-                        records: Vec::with_capacity(data.len() / 70 / threads),
-                    };
-                    let mut ids = HashMap::default();
-                    while let Some(chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        parse(chunk, base_hour, &mut shard, &mut ids);
-                    }
-                    shard
-                })
-            })
+        let workers: Vec<_> = chunks
+            .iter()
+            .map(|&c| scope.spawn(move || parse(c, base_hour)))
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
@@ -218,15 +201,6 @@ fn main() {
         .collect();
     names.sort_unstable();
     names.dedup();
-    let ranks: Vec<Vec<u32>> = shards
-        .iter()
-        .map(|s| {
-            s.endpoints
-                .iter()
-                .map(|e| names.binary_search(e).unwrap() as u32)
-                .collect()
-        })
-        .collect();
     let (lo, hi) = shards
         .iter()
         .flat_map(|s| s.records.iter())
@@ -234,62 +208,30 @@ fn main() {
             (lo.min(r >> 49), hi.max(r >> 49))
         });
     let groups = (hi - lo + 1) as usize * names.len();
-    let group_of = |t: usize, r: u64| {
-        ((r >> 49) - lo) as usize * names.len() + ranks[t][(r >> 32) as u16 as usize] as usize
-    };
+    assert!(groups < 1 << 31, "too many (hour, endpoint) groups");
 
-    // Phase 3: counting sort into one latency array, group by group, plus 5xx counts.
-    let errors: Vec<AtomicU32> = (0..groups).map(|_| AtomicU32::new(0)).collect();
-    let mut slots: Vec<Vec<u32>> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..shards.len())
-            .map(|t| {
-                let (shard, errors, group_of) = (&shards[t], &errors, &group_of);
-                scope.spawn(move || {
-                    let mut counts = vec![0u32; groups];
-                    for &r in &shard.records {
-                        let g = group_of(t, r);
-                        counts[g] += 1;
-                        if r >> 48 & 1 == 1 {
-                            errors[g].fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    counts
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).collect()
-    });
-    let mut starts = vec![0u32; groups + 1];
-    let mut position = 0u32;
-    for g in 0..groups {
-        starts[g] = position;
-        for shard_slots in slots.iter_mut() {
-            let count = shard_slots[g];
-            shard_slots[g] = position;
-            position += count;
-        }
-    }
-    starts[groups] = position;
-    let mut values = vec![0u32; position as usize];
-    let values_ptr = SharedPtr(values.as_mut_ptr());
+    // Phase 3: rewrite every record as (group, 5xx, latency) and sort each chunk by group.
     std::thread::scope(|scope| {
-        for (t, shard_slots) in slots.iter_mut().enumerate() {
-            let (shard, group_of) = (&shards[t], &group_of);
+        for shard in shards.iter_mut() {
+            let names = &names;
             scope.spawn(move || {
-                let ptr = values_ptr;
-                for &r in &shard.records {
-                    let slot = &mut shard_slots[group_of(t, r)];
-                    // SAFETY: slot indices are unique across threads by construction of the prefix sums.
-                    unsafe { *ptr.0.add(*slot as usize) = r as u32 };
-                    *slot += 1;
+                let ranks: Vec<u64> = shard
+                    .endpoints
+                    .iter()
+                    .map(|e| names.binary_search(e).unwrap() as u64)
+                    .collect();
+                for r in shard.records.iter_mut() {
+                    let group =
+                        ((*r >> 49) - lo) * names.len() as u64 + ranks[(*r >> 32) as u16 as usize];
+                    *r = group << 33 | (*r >> 48 & 1) << 32 | (*r as u32 as u64);
                 }
+                shard.records.sort_unstable();
             });
         }
     });
-    drop(slots);
-    shards.clear();
 
-    // Phase 4: percentiles and formatting, in batches of groups pulled from a counter.
+    // Phase 4: format contiguous ranges of groups in parallel. Each range finds where its first
+    // group starts in every chunk, then walks all chunks forward in step.
     let hour_text: Vec<String> = (lo..=hi)
         .map(|h| {
             let hour = h as i64 - HOUR_BIAS + base_hour;
@@ -297,43 +239,53 @@ fn main() {
             format!("{y:04}-{m:02}-{d:02}T{:02}:00:00Z ", hour.rem_euclid(24))
         })
         .collect();
-    let batch = groups.div_ceil(threads * 32).max(1);
-    let next = AtomicUsize::new(0);
-    let parts = Mutex::new(Vec::new());
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                let ptr = values_ptr;
-                loop {
-                    let first = next.fetch_add(1, Ordering::Relaxed) * batch;
-                    if first >= groups {
-                        break;
-                    }
-                    let mut text = Vec::new();
-                    for g in first..(first + batch).min(groups) {
-                        let (start, end) = (starts[g] as usize, starts[g + 1] as usize);
-                        let n = end - start;
+    let ranges = threads;
+    let parts: Vec<Vec<u8>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..ranges)
+            .map(|k| {
+                let (shards, names, hour_text) = (&shards, &names, &hour_text);
+                scope.spawn(move || {
+                    let (first, last) = (
+                        (groups * k / ranges) as u64,
+                        (groups * (k + 1) / ranges) as u64,
+                    );
+                    let mut cursors: Vec<usize> = shards
+                        .iter()
+                        .map(|s| s.records.partition_point(|&r| r >> 33 < first))
+                        .collect();
+                    let (mut text, mut values) = (Vec::new(), Vec::new());
+                    for g in first..last {
+                        values.clear();
+                        let mut errors = 0u64;
+                        for (shard, cursor) in shards.iter().zip(cursors.iter_mut()) {
+                            while let Some(&r) =
+                                shard.records.get(*cursor).filter(|&&r| r >> 33 == g)
+                            {
+                                values.push(r as u32);
+                                errors += r >> 32 & 1;
+                                *cursor += 1;
+                            }
+                        }
+                        let n = values.len();
                         if n == 0 {
                             continue;
                         }
-                        // SAFETY: groups are disjoint ranges of `values`, and each batch is taken once.
-                        let v = unsafe { std::slice::from_raw_parts_mut(ptr.0.add(start), n) };
                         let rank = |p: usize| (p * n + 99) / 100 - 1;
                         let (r50, r95, r99) = (rank(50), rank(95), rank(99));
-                        // After selecting rank r, the r smallest values sit in v[..r], so each
+                        // After selecting rank r, the r smallest values sit in values[..r], so each
                         // lower rank is selected inside the previous prefix.
-                        let p99 = *v.select_nth_unstable(r99).1;
+                        let p99 = *values.select_nth_unstable(r99).1;
                         let p95 = if r95 < r99 {
-                            *v[..r99].select_nth_unstable(r95).1
+                            *values[..r99].select_nth_unstable(r95).1
                         } else {
                             p99
                         };
                         let p50 = if r50 < r95 {
-                            *v[..r95].select_nth_unstable(r50).1
+                            *values[..r95].select_nth_unstable(r50).1
                         } else {
                             p95
                         };
-                        let errs = errors[g].load(Ordering::Relaxed) as u64;
+                        let g = g as usize;
                         text.extend_from_slice(hour_text[g / names.len()].as_bytes());
                         text.extend_from_slice(names[g % names.len()]);
                         for value in [
@@ -341,22 +293,21 @@ fn main() {
                             p50 as u64,
                             p95 as u64,
                             p99 as u64,
-                            errs,
-                            errs * 1_000_000 / n as u64,
+                            errors,
+                            errors * 1_000_000 / n as u64,
                         ] {
                             text.push(b' ');
                             push_num(&mut text, value);
                         }
                         text.push(b'\n');
                     }
-                    parts.lock().unwrap().push((first, text));
-                }
-            });
-        }
+                    text
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
-    let mut parts = parts.into_inner().unwrap();
-    parts.sort_unstable_by_key(|p| p.0);
-    for (_, text) in parts {
+    for text in parts {
         out.write_all(&text).expect("cannot write output");
     }
 }
