@@ -72,7 +72,7 @@ fn step_hash(h: u64, c: u8) -> u64 {
 /// lowercasing (every byte >= 0x80 is a separator). The hash is computed while scanning. A token
 /// longer than 32 bytes cannot be a query term and is passed as empty.
 fn tokens(text: &[u8], mut f: impl FnMut(&[u8], u64)) {
-    let (mut buf, mut len, mut h) = ([0u8; 32], 0usize, 0u64);
+    let (mut buf, mut len, mut h) = ([0u8; 40], 0usize, 0u64); // 8 spare bytes for `word`
     for &b in text.iter().chain(std::iter::once(&b' ')) {
         let c = TOKEN_BYTE[b as usize];
         if c != 0 {
@@ -88,46 +88,74 @@ fn tokens(text: &[u8], mut f: impl FnMut(&[u8], u64)) {
     }
 }
 
-/// The query terms in an open-addressing table keyed by the tokenizer's own hash, so a lookup costs
-/// one probe sequence and one byte comparison.
+/// The 8 bytes of `s` starting at `i`, bytes past its end masked to zero. `s` is always followed by
+/// at least 8 readable bytes: the tokenizer's 40-byte buffer holds tokens of at most 32 bytes, and
+/// every word in the vocabulary arena is followed by 8 bytes of padding.
+fn word(s: &[u8], i: usize) -> u64 {
+    // SAFETY: see above.
+    let w = unsafe { std::ptr::read_unaligned(s.as_ptr().add(i) as *const u64) };
+    if s.len() - i >= 8 {
+        w
+    } else {
+        w & ((1 << (8 * (s.len() - i))) - 1)
+    }
+}
+
+/// The query terms in an open-addressing table keyed by the tokenizer's own hash. A slot packs
+/// `tag:24 | length:8 | id + 1:32` (0 = empty), so most mismatches are rejected without leaving the
+/// table; a candidate is then compared 8 bytes at a time with its copy in a padded arena.
 struct Vocab {
-    slots: Vec<u32>,
-    words: Vec<&'static [u8]>,
+    slots: Vec<u64>,
+    arena: Vec<u8>,
+    starts: Vec<u32>,
     shift: u32,
 }
 
 impl Vocab {
     /// `words[id]` is the term with that id.
-    fn new(words: Vec<&'static [u8]>) -> Vocab {
+    fn new(words: &[&[u8]]) -> Vocab {
         let bits = (words.len() * 2)
             .next_power_of_two()
             .trailing_zeros()
             .max(1);
         let mut vocab = Vocab {
-            slots: vec![u32::MAX; 1 << bits],
-            words,
+            slots: vec![0; 1 << bits],
+            arena: Vec::new(),
+            starts: Vec::new(),
             shift: 64 - bits,
         };
-        for id in 0..vocab.words.len() {
-            let h = vocab.words[id].iter().fold(0, |h, &c| step_hash(h, c));
+        for (id, word) in words.iter().enumerate() {
+            let h = word.iter().fold(0, |h, &c| step_hash(h, c));
             let mut i = (h >> vocab.shift) as usize;
-            while vocab.slots[i] != u32::MAX {
+            while vocab.slots[i] != 0 {
                 i = (i + 1) & (vocab.slots.len() - 1);
             }
-            vocab.slots[i] = id as u32;
+            vocab.slots[i] = (h & 0xFF_FFFF) << 40 | (word.len() as u64) << 32 | (id as u64 + 1);
+            vocab.starts.push(vocab.arena.len() as u32);
+            vocab.arena.extend_from_slice(word);
+            vocab.arena.extend_from_slice(&[0; 8]);
         }
         vocab
     }
 
     fn get(&self, token: &[u8], h: u64) -> Option<u32> {
+        let key = (h & 0xFF_FFFF) << 40 | (token.len() as u64) << 32;
         let mut i = (h >> self.shift) as usize;
         loop {
-            let id = self.slots[i];
-            if id == u32::MAX {
+            let slot = self.slots[i];
+            if slot == 0 {
                 return None;
             }
-            if self.words[id as usize] == token {
-                return Some(id);
+            if slot >> 32 == key >> 32 {
+                let id = (slot as u32 - 1) as usize;
+                let start = self.starts[id] as usize;
+                let known = &self.arena[start..start + token.len()];
+                if (0..token.len())
+                    .step_by(8)
+                    .all(|k| word(known, k) == word(token, k))
+                {
+                    return Some(id as u32);
+                }
             }
             i = (i + 1) & (self.slots.len() - 1);
         }
@@ -405,7 +433,7 @@ fn main() {
     for (&word, &id) in &terms {
         words[id as usize] = word;
     }
-    let vocab = Vocab::new(words);
+    let vocab = Vocab::new(&words);
     let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
     let states = automaton.fail.len();
 
