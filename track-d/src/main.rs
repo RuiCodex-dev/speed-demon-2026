@@ -116,11 +116,14 @@ fn main() {
 
     // Pass 1: parse every chunk into (tail, head, weight) and count out-degrees.
     let degree: Vec<AtomicU32> = (0..n + 1).map(|_| AtomicU32::new(0)).collect();
+    // has_in[v]: v has an in-edge from another node, so a path from some s != v can end at v.
+    let has_in: Vec<std::sync::atomic::AtomicU64> =
+        (0..n.div_ceil(64)).map(|_| Default::default()).collect();
     let parsed: Vec<Vec<(u32, u32, u32)>> = std::thread::scope(|scope| {
         let workers: Vec<_> = chunks
             .iter()
             .map(|&chunk| {
-                let degree = &degree;
+                let (degree, has_in) = (&degree, &has_in);
                 scope.spawn(move || {
                     let mut out = Vec::with_capacity(chunk.len() / 16);
                     let mut p = 0;
@@ -131,6 +134,9 @@ fn main() {
                             number(chunk, &mut p),
                         );
                         degree[u as usize].fetch_add(1, Ordering::Relaxed);
+                        if u != v {
+                            has_in[v as usize / 64].fetch_or(1 << (v % 64), Ordering::Relaxed);
+                        }
                         out.push((u as u32, v as u32, w as u32));
                     }
                     out
@@ -190,7 +196,13 @@ fn main() {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(&(s, t)) = list.get(i) else { break };
-                    let answer = shortest(&offsets, &edges, s, t, &mut dist, &mut touched);
+                    let reachable = s == t
+                        || has_in[t as usize / 64].load(Ordering::Relaxed) >> (t % 64) & 1 == 1;
+                    let answer = if reachable {
+                        shortest(&offsets, &edges, s, t, &mut dist, &mut touched)
+                    } else {
+                        None
+                    };
                     answers[i]
                         .0
                         .store(answer.unwrap_or(u64::MAX), Ordering::Relaxed);
