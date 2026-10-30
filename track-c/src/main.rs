@@ -11,7 +11,7 @@
 //!    stays in cache, never the 200 MB input. Each record then sets the bit (country, id).
 //!    Nothing is stored per record.
 use std::collections::HashMap;
-use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -51,6 +51,44 @@ impl Hasher for Fx {
 }
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// The 8 bytes of `name` starting at `i`, bytes past its end masked to zero. Every name passed here
+/// is followed by at least 8 readable bytes: in the input by the rest of its record (`","...,0.00` and
+/// a terminator), in the arena and in unescaped copies by explicit padding.
+fn word(name: &[u8], i: usize) -> u64 {
+    // SAFETY: see above.
+    let w = unsafe { std::ptr::read_unaligned(name.as_ptr().add(i) as *const u64) };
+    if name.len() - i >= 8 {
+        w
+    } else {
+        w & ((1 << (8 * (name.len() - i))) - 1)
+    }
+}
+
+/// FxHash-style hash of a name, 8 bytes per step, without copying.
+fn hash(name: &[u8]) -> u64 {
+    (0..name.len()).step_by(8).fold(name.len() as u64, |h, i| {
+        (h.rotate_left(5) ^ word(name, i)).wrapping_mul(0x517cc1b727220a95)
+    })
+}
+
+/// Byte equality of two names, 8 bytes at a time.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && (0..a.len()).step_by(8).all(|i| word(a, i) == word(b, i))
+}
+
+/// Index of the first `"` at or after `i`, testing 8 bytes at a time where 8 bytes remain.
+fn find_quote(s: &[u8], mut i: usize) -> usize {
+    while let Some(bytes) = s.get(i..i + 8) {
+        let w = u64::from_le_bytes(bytes.try_into().unwrap()) ^ 0x2222_2222_2222_2222;
+        let zero = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
+        if zero != 0 {
+            return i + zero.trailing_zeros() as usize / 8; // the lowest zero byte is exact
+        }
+        i += 8;
+    }
+    i + s[i..].iter().position(|&b| b == b'"').unwrap()
+}
 
 #[derive(Clone, Copy)]
 struct Totals {
@@ -121,7 +159,7 @@ impl Names {
     }
 
     fn id(&self, name: &[u8]) -> usize {
-        let h = BuildHasherDefault::<Fx>::default().hash_one(name);
+        let h = hash(name);
         let (tag, mask) = (h >> 32, self.slots.len() - 1);
         let mut i = h as usize & mask;
         loop {
@@ -133,7 +171,7 @@ impl Names {
                     self.full.store(true, Ordering::Relaxed);
                     return 0;
                 }
-                let at = self.arena_used.fetch_add(name.len(), Ordering::Relaxed);
+                let at = self.arena_used.fetch_add(name.len() + 8, Ordering::Relaxed); // + padding for `word`
                 // SAFETY: `at..at + len` was handed to this thread alone by the fetch_add above, and
                 // nobody reads it before the span below is published with Release.
                 unsafe {
@@ -150,7 +188,7 @@ impl Names {
                     Err(other) => slot = other, // another thread won this slot; its id stays unused
                 }
             }
-            if slot >> 32 == tag && self.bytes((slot as u32 - 1) as usize) == name {
+            if slot >> 32 == tag && same(self.bytes((slot as u32 - 1) as usize), name) {
                 return (slot as u32 - 1) as usize;
             }
             i = (i + 1) & mask;
@@ -172,9 +210,7 @@ fn text_field(data: &'static [u8], p: &mut usize) -> (&'static [u8], usize) {
     let mut i = start;
     let mut escapes = 0;
     loop {
-        while data[i] != b'"' {
-            i += 1;
-        }
+        i = find_quote(data, i);
         if data.get(i + 1) == Some(&b'"') {
             escapes += 1;
             i += 2;
@@ -194,14 +230,18 @@ fn integer(data: &[u8], p: &mut usize) -> u64 {
     value
 }
 
-fn unescape(raw: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(raw.len());
+/// The unescaped value of a quoted field (`""` -> `"`), followed by 8 bytes of padding for `word`;
+/// the returned length excludes the padding.
+fn unescape(raw: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(raw.len() + 8);
     let mut i = 0;
     while i < raw.len() {
         out.push(raw[i]);
         i += if raw[i] == b'"' { 2 } else { 1 };
     }
-    out
+    let len = out.len();
+    out.extend_from_slice(&[0; 8]);
+    (out, len)
 }
 
 /// Parses whole records in `data[start..end]` (both on record boundaries): totals into `totals`,
@@ -250,7 +290,10 @@ fn parse(
         let name_id = if name_escapes == 0 {
             names.id(name)
         } else {
-            names.id(&unescape(name))
+            {
+                let (copy, len) = unescape(name);
+                names.id(&copy[..len])
+            }
         };
         seen[country as usize * words + name_id / 64]
             .fetch_or(1 << (name_id % 64), Ordering::Relaxed);
@@ -380,7 +423,7 @@ fn main() {
     // names fits; if a dataset has more distinct names, the run is repeated with 4 times as many.
     let mut capacity = 1 << 18;
     let (totals, names, seen, words) = loop {
-        let names = Names::new(capacity, data.len());
+        let names = Names::new(capacity, data.len() * 2); // names + 8 bytes of padding each
         let words = capacity / 2 / 64;
         let seen = zeroed_atomics(words * keys.len());
         let next = AtomicUsize::new(0);
