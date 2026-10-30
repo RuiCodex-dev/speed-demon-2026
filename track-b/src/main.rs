@@ -105,6 +105,9 @@ fn word(s: &[u8], i: usize) -> u64 {
 /// `tag:24 | length:8 | id + 1:32` (0 = empty), so most mismatches are rejected without leaving the
 /// table; a candidate is then compared 8 bytes at a time with its copy in a padded arena.
 struct Vocab {
+    /// One bit per value of the hash's low 21 bits, set for every term: a 256 KB filter that stays
+    /// in cache and turns away most tokens that are not query terms before they touch `slots`.
+    filter: Vec<u64>,
     slots: Vec<u64>,
     arena: Vec<u8>,
     starts: Vec<u32>,
@@ -119,6 +122,7 @@ impl Vocab {
             .trailing_zeros()
             .max(1);
         let mut vocab = Vocab {
+            filter: vec![0; 1 << 15],
             slots: vec![0; 1 << bits],
             arena: Vec::new(),
             starts: Vec::new(),
@@ -126,6 +130,7 @@ impl Vocab {
         };
         for (id, word) in words.iter().enumerate() {
             let h = word.iter().fold(0, |h, &c| step_hash(h, c));
+            vocab.filter[(h as usize >> 6) & ((1 << 15) - 1)] |= 1 << (h % 64);
             let mut i = (h >> vocab.shift) as usize;
             while vocab.slots[i] != 0 {
                 i = (i + 1) & (vocab.slots.len() - 1);
@@ -139,6 +144,9 @@ impl Vocab {
     }
 
     fn get(&self, token: &[u8], h: u64) -> Option<u32> {
+        if self.filter[(h as usize >> 6) & ((1 << 15) - 1)] >> (h % 64) & 1 == 0 {
+            return None;
+        }
         let key = (h & 0xFF_FFFF) << 40 | (token.len() as u64) << 32;
         let mut i = (h >> self.shift) as usize;
         loop {
