@@ -28,13 +28,23 @@ fn map_file(path: &str) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(ptr, len) }
 }
 
-/// FxHash-style hash of a byte string: one rotate, xor and multiply per 8 bytes.
-fn hash(bytes: &[u8]) -> u64 {
-    bytes.chunks(8).fold(bytes.len() as u64, |h, chunk| {
-        let mut word = [0u8; 8];
-        word[..chunk.len()].copy_from_slice(chunk);
-        (h.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517cc1b727220a95)
-    })
+/// The 8 bytes of an endpoint starting at `i`, with bytes past its end masked to zero. An endpoint
+/// is always followed by at least 7 more bytes of its line (" 200 0\n" is the shortest tail), so an
+/// 8-byte read from any position inside it stays inside the mapping.
+fn word(name: &[u8], i: usize) -> u64 {
+    // SAFETY: see above; `name` is a slice of the mapped file with that tail after it.
+    let w = unsafe { std::ptr::read_unaligned(name.as_ptr().add(i) as *const u64) };
+    if name.len() - i >= 8 { w } else { w & ((1 << (8 * (name.len() - i))) - 1) }
+}
+
+/// FxHash-style hash of an endpoint: one rotate, xor and multiply per 8 bytes, no copying.
+fn hash(name: &[u8]) -> u64 {
+    (0..name.len()).step_by(8).fold(name.len() as u64, |h, i| (h.rotate_left(5) ^ word(name, i)).wrapping_mul(0x517cc1b727220a95))
+}
+
+/// Byte equality of two endpoints, 8 bytes at a time.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && (0..a.len()).step_by(8).all(|i| word(a, i) == word(b, i))
 }
 
 /// Index of the first space at or after `i`, testing 8 bytes at a time where 8 bytes remain.
@@ -63,7 +73,7 @@ impl Endpoints {
         let mut i = (h >> 40) as usize & mask;
         while self.slots[i] != 0 {
             let (known, known_hash) = self.names[self.slots[i] as usize - 1];
-            if known_hash == h && known == name {
+            if known_hash == h && same(known, name) {
                 return self.slots[i] as u16 - 1;
             }
             i = (i + 1) & mask;
