@@ -10,6 +10,7 @@
 //!    copy of every distinct name in a compact arena, so the exact byte comparison reads memory that
 //!    stays in cache, never the 200 MB input. Each record then sets the bit (country, id).
 //!    Nothing is stored per record.
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
@@ -124,6 +125,9 @@ struct Names {
     arena_used: AtomicUsize,
     /// Set when the table is too full to be trusted; the run is then repeated with a bigger one.
     full: AtomicBool,
+    /// One bit per (country, name id), `words` u64s per country.
+    seen: Vec<AtomicU64>,
+    words: usize,
 }
 
 // SAFETY: the arena is written only in ranges handed out by `arena_used.fetch_add`, each to one
@@ -138,15 +142,26 @@ fn zeroed_atomics(n: usize) -> Vec<AtomicU64> {
 }
 
 impl Names {
-    fn new(capacity: usize, arena_bytes: usize) -> Names {
-        assert!(capacity / 2 < 1 << 22 && arena_bytes < 1 << 32, "input too large for the name table");
+    fn new(capacity: usize, arena_bytes: usize, countries: usize) -> Names {
+        assert!(
+            capacity / 2 < 1 << 22 && arena_bytes < 1 << 32,
+            "input too large for the name table"
+        );
         Names {
             slots: zeroed_atomics(capacity),
             arena: vec![0u8; arena_bytes].leak().as_mut_ptr(),
             next_id: AtomicUsize::new(0),
             arena_used: AtomicUsize::new(0),
             full: AtomicBool::new(false),
+            seen: zeroed_atomics(capacity / 128 * countries),
+            words: capacity / 128,
         }
+    }
+
+    /// Marks `name` (hash `h`) as seen with `country`.
+    fn see(&self, name: &[u8], h: u64, country: usize) {
+        let id = self.id(name, h);
+        self.seen[country * self.words + id / 64].fetch_or(1 << (id % 64), Ordering::Relaxed);
     }
 
     /// Starts loading the slot where a lookup of a name with hash `h` begins.
@@ -168,21 +183,38 @@ impl Names {
                     self.full.store(true, Ordering::Relaxed);
                     return 0;
                 }
-                let at = self.arena_used.fetch_add(2 + name.len() + 8, Ordering::Relaxed);
+                let at = self
+                    .arena_used
+                    .fetch_add(2 + name.len() + 8, Ordering::Relaxed);
                 // SAFETY: `at..at + 2 + len` was handed to this thread alone by the fetch_add above,
                 // and nobody reads it before the slot naming it is published with Release.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(len.to_le_bytes().as_ptr(), self.arena.add(at), 2);
-                    std::ptr::copy_nonoverlapping(name.as_ptr(), self.arena.add(at + 2), name.len());
+                    std::ptr::copy_nonoverlapping(
+                        len.to_le_bytes().as_ptr(),
+                        self.arena.add(at),
+                        2,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        name.as_ptr(),
+                        self.arena.add(at + 2),
+                        name.len(),
+                    );
                 }
-                match self.slots[i].compare_exchange(0, tag << 54 | (id as u64 + 1) << 32 | at as u64, Ordering::AcqRel, Ordering::Acquire) {
+                match self.slots[i].compare_exchange(
+                    0,
+                    tag << 54 | (id as u64 + 1) << 32 | at as u64,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
                     Ok(_) => return id,
                     Err(other) => slot = other, // another thread won this slot; its id stays unused
                 }
             }
             if slot >> 54 == tag {
                 // SAFETY: the slot was published after its arena entry was written.
-                let entry = unsafe { std::slice::from_raw_parts(self.arena.add(slot as u32 as usize), 2 + name.len()) };
+                let entry = unsafe {
+                    std::slice::from_raw_parts(self.arena.add(slot as u32 as usize), 2 + name.len())
+                };
                 if entry[..2] == len.to_le_bytes() && same(&entry[2..], name) {
                     return (slot >> 32 & 0x3F_FFFF) as usize - 1;
                 }
@@ -241,17 +273,14 @@ fn unescape(raw: &[u8]) -> (Vec<u8>, usize) {
 }
 
 /// Parses whole records in `data[start..end]` (both on record boundaries): totals into `totals`,
-/// one bit per (country, name id) into `seen`, which has `words` words per country.
+/// every (country, name) pair into `names`.
 fn parse<C: Copy + Into<u16>>(
     data: &'static [u8],
-    start: usize,
-    end: usize,
+    (start, end): (usize, usize),
     country_of: &[C],
     unmatched: u16,
     totals: &mut [Totals],
     names: &Names,
-    seen: &[AtomicU64],
-    words: usize,
 ) {
     // Two records are in flight: the next one is parsed and the cache lines its lookups will need
     // are requested while the previous one is counted, so the two misses overlap with work.
@@ -276,8 +305,10 @@ fn parse<C: Copy + Into<u16>>(
             let cents = whole * 100 + ((data[p + 1] - b'0') * 10 + (data[p + 2] - b'0')) as i64;
             p += 3;
             p += if data.get(p) == Some(&b'\r') { 2 } else { 1 };
-            let copy = if name_escapes == 0 { (Vec::new(), raw.len()) } else { unescape(raw) };
-            let h = hash(if name_escapes == 0 { raw } else { &copy.0[..copy.1] });
+            let copy = (name_escapes > 0)
+                .then(|| unescape(raw))
+                .unwrap_or((Vec::new(), raw.len()));
+            let h = hash(copy.0.get(..copy.1).unwrap_or(raw));
             names.prefetch(h);
             if let Some(c) = country_of.get(region) {
                 prefetch(c);
@@ -302,10 +333,8 @@ fn parse<C: Copy + Into<u16>>(
             t.amount_max = t.amount_max.max(r.amount);
             t.name_bytes += r.copy.1 as u64;
             t.note_bytes += r.note_bytes;
-            let name = if r.copy.0.is_empty() { r.raw } else { &r.copy.0[..r.copy.1] };
-            let name_id = names.id(name, r.h);
-            seen[country as usize * words + name_id / 64]
-                .fetch_or(1 << (name_id % 64), Ordering::Relaxed);
+            let name = r.copy.0.get(..r.copy.1).unwrap_or(r.raw);
+            names.see(name, r.h, country as usize);
         }
         match next {
             Some(r) => pending = Some(r),
@@ -330,7 +359,7 @@ struct Record {
 /// Asks for the cache line holding `x`; never faults.
 fn prefetch<T>(x: &T) {
     // SAFETY: a prefetch has no architectural effect.
-    unsafe { std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(x as *const T as *const i8) };
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(x as *const T as *const i8) };
 }
 
 fn push_num(out: &mut Vec<u8>, mut value: u64) {
@@ -396,19 +425,16 @@ fn main() {
     for (sorted, key) in keys.iter().enumerate() {
         rank[seen_codes[key] as usize] = sorted as u16;
     }
-    let country_of: Vec<u16> = region_code
-        .iter()
-        .map(|&c| {
-            if c == u16::MAX {
-                unmatched
-            } else {
-                rank[c as usize]
-            }
-        })
+    let country_of: Vec<u16> = (region_code.iter())
+        .map(|&c| rank.get(c as usize).map_or(unmatched, |&r| r))
         .collect();
     // With up to 255 countries the map is one byte per region (1 MB for the spec's ids), which stays
     // in the scoring CPU's L2 cache; the per-record lookup was a cache miss at two bytes.
-    let small_map: Vec<u8> = if keys.len() < 255 { country_of.iter().map(|&c| c as u8).collect() } else { Vec::new() };
+    let small_map: Vec<u8> = if keys.len() < 255 {
+        country_of.iter().map(|&c| c as u8).collect()
+    } else {
+        Vec::new()
+    };
     keys.push(b"_UNMATCHED"); // `_` sorts after every [A-Z] code, so it stays last
 
     // records.csv: skip the BOM and the header, then cut the body into chunks.
@@ -461,10 +487,8 @@ fn main() {
     // The name table starts at 2^18 slots (half of them usable), which the spec's pool of 100,000
     // names fits; if a dataset has more distinct names, the run is repeated with 4 times as many.
     let mut capacity = 1 << 18;
-    let (totals, names, seen, words) = loop {
-        let names = Names::new(capacity, data.len() * 3); // names + 10 bytes of length and padding each
-        let words = capacity / 2 / 64;
-        let seen = zeroed_atomics(words * keys.len());
+    let (totals, names) = loop {
+        let names = Names::new(capacity, data.len() * 3, keys.len()); // + 10 bytes per name
         let next = AtomicUsize::new(0);
         let totals: Vec<Vec<Totals>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..threads)
@@ -474,10 +498,11 @@ fn main() {
                         while let Some(w) =
                             starts.windows(2).nth(next.fetch_add(1, Ordering::Relaxed))
                         {
+                            let w = (w[0], w[1]);
                             if small_map.is_empty() {
-                                parse(data, w[0], w[1], &country_of, unmatched, &mut totals, &names, &seen, words);
+                                parse(data, w, &country_of, unmatched, &mut totals, &names);
                             } else {
-                                parse(data, w[0], w[1], &small_map, unmatched, &mut totals, &names, &seen, words);
+                                parse(data, w, &small_map, unmatched, &mut totals, &names);
                             }
                         }
                         totals
@@ -487,7 +512,7 @@ fn main() {
             workers.into_iter().map(|w| w.join().unwrap()).collect()
         });
         if !names.full.load(Ordering::Relaxed) {
-            break (totals, names, seen, words);
+            break (totals, names);
         }
         capacity *= 4;
     };
@@ -508,7 +533,8 @@ fn main() {
         if t.count == 0 {
             continue;
         }
-        let distinct: u32 = seen[c * words..c * words + used_words]
+        let words = names.words;
+        let distinct: u32 = names.seen[c * words..c * words + used_words]
             .iter()
             .map(|w| w.load(Ordering::Relaxed).count_ones())
             .sum();
