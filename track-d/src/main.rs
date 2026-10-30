@@ -12,6 +12,7 @@
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
 //!    Distances live in 1024-node pages taken from a per-thread pool, so a thread holds only the
 //!    pages its current search touched.
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -204,6 +205,13 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
                     let key = T::try_from(nd + 1).map_err(|_| ())?;
                     dist.set(v, key);
                     heap.push(key, v);
+                    // v will probably be settled later: start loading its edges now.
+                    // SAFETY: a prefetch never faults, whatever the address.
+                    let at = g
+                        .edges
+                        .as_ptr()
+                        .wrapping_add(g.offsets[v as usize] as usize);
+                    unsafe { _mm_prefetch::<_MM_HINT_T0>(at as *const i8) };
                 }
             }
         }
