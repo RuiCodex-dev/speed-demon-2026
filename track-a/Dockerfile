@@ -5,4 +5,5 @@ RUN RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --offline
 
 FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 COPY --from=build /src/target/release/solution /app/solution
+ENV RUST_MIN_STACK=262144
 ENTRYPOINT ["/app/solution"]
