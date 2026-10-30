@@ -6,14 +6,14 @@
 //!    `"` precede it: a parallel quote count plus a prefix parity tells every chunk where it starts,
 //!    and the chunk then begins after its first record terminator outside quotes.
 //! 3. Each thread parses its records with a byte state machine and keeps per-country totals.
-//! 4. Distinct names per country, exactly and in parallel: every name belongs to the partition
-//!    `hash % threads`. Threads intern names locally and file both their new names and their
-//!    (country, name) pairs under that partition; then each partition's owner merges only its own
-//!    names from all threads and counts them with one small bitset per country.
+//! 4. Distinct names per country, exactly and in parallel: every record appends its country and
+//!    unescaped name to the buffer of the name's partition (`hash % threads`), which is a sequential
+//!    write instead of a lookup in a large table. Each partition's owner then interns only its own
+//!    names, in a table small enough to stay in cache, and counts them with one bitset per country.
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::io::Write;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -75,16 +75,8 @@ const EMPTY: Totals = Totals {
 
 struct Shard {
     totals: Vec<Totals>,
-    /// Name -> thread-local id.
-    names: FxMap<&'static [u8], u32>,
-    /// Partition of each local id.
-    partition_of: Vec<u8>,
-    /// Per partition: (local id, name) of the names this thread met first.
-    new_names: Vec<Vec<(u32, &'static [u8])>>,
-    /// Per partition: (country, local name id) for every record.
-    pairs: Vec<Vec<(u16, u32)>>,
-    /// Local id -> id inside its partition, written by that partition's owner only.
-    partition_id: Vec<AtomicU32>,
+    /// Per name partition, one entry per record: country (u16), name length (u16), name bytes.
+    names: Vec<Vec<u8>>,
 }
 
 /// Reads a text field starting at `*p` and leaves `*p` on the byte after it (`,` or a terminator).
@@ -142,7 +134,6 @@ fn parse(
     unmatched: u16,
     shard: &mut Shard,
 ) {
-    let parts = shard.pairs.len() as u64;
     let mut p = start;
     while p < end {
         if data[p..].starts_with(BOM) {
@@ -173,20 +164,24 @@ fn parse(
         t.amount_max = t.amount_max.max(amount);
         t.name_bytes += (name.len() - name_escapes) as u64;
         t.note_bytes += (note.len() - note_escapes) as u64;
-        // A name with `""` is stored unescaped; that copy is rare and lives until exit.
-        let key: &'static [u8] = if name_escapes == 0 {
+        // The record's (country, unescaped name) goes to the buffer of the name's hash partition.
+        let unescaped;
+        let name: &[u8] = if name_escapes == 0 {
             name
         } else {
-            Box::leak(unescape(name).into_boxed_slice())
+            unescaped = unescape(name);
+            &unescaped
         };
-        let next = shard.partition_of.len() as u32;
-        let local = *shard.names.entry(key).or_insert_with(|| {
-            let part = (BuildHasherDefault::<Fx>::default().hash_one(key) % parts) as usize;
-            shard.partition_of.push(part as u8);
-            shard.new_names[part].push((next, key));
-            next
-        });
-        shard.pairs[shard.partition_of[local as usize] as usize].push((country, local));
+        let parts = shard.names.len() as u64;
+        let buf =
+            &mut shard.names[(BuildHasherDefault::<Fx>::default().hash_one(name) % parts) as usize];
+        buf.extend_from_slice(&country.to_le_bytes());
+        buf.extend_from_slice(
+            &u16::try_from(name.len())
+                .expect("name longer than 64 KiB")
+                .to_le_bytes(),
+        );
+        buf.extend_from_slice(name);
     }
 }
 
@@ -321,11 +316,7 @@ fn main() {
                 scope.spawn(|| {
                     let mut shard = Shard {
                         totals: vec![EMPTY; keys.len()],
-                        names: FxMap::default(),
-                        partition_of: Vec::new(),
-                        new_names: vec![Vec::new(); threads],
-                        pairs: vec![Vec::new(); threads],
-                        partition_id: Vec::new(),
+                        names: vec![Vec::new(); threads],
                     };
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
@@ -341,9 +332,6 @@ fn main() {
                             &mut shard,
                         );
                     }
-                    shard.partition_id = (0..shard.partition_of.len())
-                        .map(|_| AtomicU32::new(0))
-                        .collect();
                     shard
                 })
             })
@@ -351,32 +339,35 @@ fn main() {
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
 
-    // Distinct names, one partition per thread: merge the partition's names from every shard, then
-    // set one bit per (country, name) and count. Returns the count per country.
+    // Distinct names, one partition per thread: stream the partition's entries from every shard,
+    // intern the names (a few thousand per partition, so the table stays in cache) and set one bit
+    // per (country, name). Returns the count per country.
     let distinct: Vec<Vec<u32>> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|part| {
                 let (shards, keys) = (&shards, &keys);
                 scope.spawn(move || {
                     let mut ids: FxMap<&[u8], u32> = FxMap::default();
+                    let mut bits: Vec<Vec<u64>> = vec![Vec::new(); keys.len()];
                     for shard in shards {
-                        for &(local, name) in &shard.new_names[part] {
+                        let buf = &shard.names[part];
+                        let mut i = 0;
+                        while i < buf.len() {
+                            let country = u16::from_le_bytes([buf[i], buf[i + 1]]) as usize;
+                            let len = u16::from_le_bytes([buf[i + 2], buf[i + 3]]) as usize;
+                            let name = &buf[i + 4..i + 4 + len];
+                            i += 4 + len;
                             let next = ids.len() as u32;
-                            shard.partition_id[local as usize]
-                                .store(*ids.entry(name).or_insert(next), Ordering::Relaxed);
+                            let id = *ids.entry(name).or_insert(next) as usize;
+                            let words = &mut bits[country];
+                            if words.len() <= id / 64 {
+                                words.resize(id / 64 + 1, 0);
+                            }
+                            words[id / 64] |= 1 << (id % 64);
                         }
                     }
-                    let words = ids.len().div_ceil(64);
-                    let mut bits = vec![0u64; words * keys.len()];
-                    for shard in shards {
-                        for &(country, local) in &shard.pairs[part] {
-                            let id =
-                                shard.partition_id[local as usize].load(Ordering::Relaxed) as usize;
-                            bits[country as usize * words + id / 64] |= 1 << (id % 64);
-                        }
-                    }
-                    bits.chunks(words.max(1))
-                        .map(|c| c.iter().map(|w| w.count_ones()).sum())
+                    bits.iter()
+                        .map(|w| w.iter().map(|x| x.count_ones()).sum())
                         .collect::<Vec<u32>>()
                 })
             })
