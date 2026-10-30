@@ -177,6 +177,57 @@ fn main() {
     });
     drop(parsed);
 
+    // Renumber nodes in breadth-first order so that a search touches nearby memory: the input ids
+    // are a random relabelling, which makes every distance and adjacency access a cache miss.
+    let mut rank = vec![u32::MAX; n];
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    for root in 0..n as u32 {
+        if rank[root as usize] != u32::MAX {
+            continue;
+        }
+        rank[root as usize] = order.len() as u32;
+        order.push(root);
+        let mut head = order.len() - 1;
+        while head < order.len() {
+            let u = order[head] as usize;
+            head += 1;
+            for &(v, _) in &edges[offsets[u] as usize..offsets[u + 1] as usize] {
+                if rank[v as usize] == u32::MAX {
+                    rank[v as usize] = order.len() as u32;
+                    order.push(v);
+                }
+            }
+        }
+    }
+    let mut new_offsets = vec![0u32; n + 1];
+    for (i, &old) in order.iter().enumerate() {
+        new_offsets[i + 1] = new_offsets[i] + offsets[old as usize + 1] - offsets[old as usize];
+    }
+    // Rebuild the adjacency in the new numbering, one contiguous range of new ids per thread.
+    let mut new_edges = vec![(0u32, 0u32); m];
+    std::thread::scope(|scope| {
+        let mut rest = &mut new_edges[..];
+        let mut first = 0;
+        for k in 1..=threads {
+            let last = n * k / threads;
+            let (mine, tail) = rest.split_at_mut((new_offsets[last] - new_offsets[first]) as usize);
+            rest = tail;
+            let (order, offsets, edges, rank) = (&order[first..last], &offsets, &edges, &rank);
+            scope.spawn(move || {
+                let mut dst = mine.iter_mut();
+                for &old in order {
+                    for &(v, w) in
+                        &edges[offsets[old as usize] as usize..offsets[old as usize + 1] as usize]
+                    {
+                        *dst.next().unwrap() = (rank[v as usize], w);
+                    }
+                }
+            });
+            first = last;
+        }
+    });
+    let (offsets, edges) = (new_offsets, new_edges);
+
     // Queries, answered in parallel; answers land in their input order.
     let mut list = Vec::new();
     let mut p = 0;
@@ -198,6 +249,7 @@ fn main() {
                     let Some(&(s, t)) = list.get(i) else { break };
                     let reachable = s == t
                         || has_in[t as usize / 64].load(Ordering::Relaxed) >> (t % 64) & 1 == 1;
+                    let (s, t) = (rank[s as usize], rank[t as usize]);
                     let answer = if reachable {
                         shortest(&offsets, &edges, s, t, &mut dist, &mut touched)
                     } else {
