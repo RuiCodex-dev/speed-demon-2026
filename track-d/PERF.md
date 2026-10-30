@@ -51,12 +51,12 @@ unreached, so the arrays need no initialisation and untouched pages cost nothing
 size. The spec has distances above 2^32; a search that would overflow returns an error and is repeated
 exactly with a `u64` array allocated on first need. One generic function serves both. Peak 256 -> 182 MB.
 
-**Step 7 (pending on the board).** The build was three passes of random atomic updates over node-sized
+**Step 7 - the build.** The build was three passes of random atomic updates over node-sized
 arrays: ~15M cache misses each. Now one text parse files every edge into a bucket by tail id
 (`u >> 13`, about 8k nodes) with sequential writes, each thread marks in-edges in its own 218 KB bitset,
 and each bucket is counting-sorted into its slice of the CSR inside the cache. Regrowing the bucket
 vectors showed up as system time (0.69 -> 1.71 s) until they were pre-sized from the chunk length.
-A/B 1.58 +/- 0.40x.
+A/B 1.58 +/- 0.40x; board 0.426 -> 0.319 s.
 
 **Step 8 - queries in source order.** A per-phase timer (quietest local run): parse 34 ms, CSR 17, BFS
 55, renumbered CSR 44, queries 264. Taking the queries in order of their source's new id makes the 12
