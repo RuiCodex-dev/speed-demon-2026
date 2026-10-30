@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Maps a whole file read-only for the life of the process.
@@ -334,16 +335,16 @@ impl Phrases {
 
 /// Counting sort of packed postings, `key << shift | (doc - base)` with keys in `lo..lo + keys`,
 /// from chunks given in document order with their base document: each key's docs end up contiguous
-/// and ascending. Returns every key's start offset and the docs.
+/// and ascending. Returns every key's start offset and the docs. Each chunk is freed once placed.
 fn group_by_key(
-    chunks: &[(&[u32], u32)],
+    chunks: Vec<(Vec<u32>, u32)>,
     lo: usize,
     keys: usize,
     shift: u32,
 ) -> (Vec<usize>, Vec<u32>) {
     let mut starts = vec![0usize; keys + 1];
-    for (chunk, _) in chunks {
-        for &p in chunk.iter() {
+    for (chunk, _) in &chunks {
+        for &p in chunk {
             starts[(p >> shift) as usize - lo + 1] += 1;
         }
     }
@@ -352,8 +353,8 @@ fn group_by_key(
     }
     let mut fill = starts.clone();
     let mut docs = vec![0u32; starts[keys]];
-    for &(chunk, base) in chunks {
-        for &p in chunk.iter() {
+    for (chunk, base) in chunks {
+        for p in chunk {
             let k = (p >> shift) as usize - lo;
             docs[fill[k]] = base + (p & ((1 << shift) - 1));
             fill[k] += 1;
@@ -428,6 +429,9 @@ fn line_start(data: &[u8], mut pos: usize) -> usize {
 const NEWLINE: u8 = 10;
 
 fn main() {
+    // SAFETY: plain libc call. M_MMAP_THRESHOLD = 128 KB, fixed: glibc otherwise raises it after a
+    // large block is freed, and later large blocks then come from the heap and stay resident.
+    unsafe { mallopt(-3, 1 << 17) };
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
@@ -469,11 +473,13 @@ fn main() {
         }
     }
     let term_count = terms.len();
-    let mut term_words = vec![&b""[..]; term_count];
+    let mut words = vec![&b""[..]; term_count];
     for (&word, &id) in &terms {
-        term_words[id as usize] = word;
+        words[id as usize] = word;
     }
-    let vocab = Vocab::new(&term_words);
+    let vocab = Vocab::new(&words);
+    let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
+    let states = automaton.fail.len();
 
     // 2. Frequent BOOL terms get a bitmap over all documents instead of a posting list. A sample of
     //    about 1/64 of the corpus, spread over the file, estimates each term's document frequency;
@@ -496,7 +502,7 @@ fn main() {
     let samples: Vec<(u32, Vec<u32>)> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|k| {
-                let vocab = &vocab;
+                let (vocab, in_bool) = (&vocab, &in_bool);
                 scope.spawn(move || {
                     let start = line_start(docs, docs.len() * k / threads);
                     let end = line_start(docs, start + docs.len() / threads / 64);
@@ -507,7 +513,7 @@ fn main() {
                         tokens(text, |token, h| {
                             if let Some(t) = vocab
                                 .get(token, h)
-                                .filter(|&t| last[t as usize] != doc)
+                                .filter(|&t| in_bool[t as usize] && last[t as usize] != doc)
                             {
                                 last[t as usize] = doc;
                                 df[t as usize] += 1;
@@ -521,39 +527,11 @@ fn main() {
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
     let sampled_docs: u32 = samples.iter().map(|s| s.0).sum();
-    // Renumber the terms by sampled document frequency, so the per-term tables of the scan keep
-    // the frequent terms together in a few cache lines.
-    let df: Vec<u32> = (0..term_count)
-        .map(|t| samples.iter().map(|s| s.1[t]).sum())
-        .collect();
-    let mut order: Vec<u32> = (0..term_count as u32).collect();
-    order.sort_by_key(|&t| std::cmp::Reverse(df[t as usize]));
-    let mut new_id = vec![0; term_count];
-    for (n, &t) in order.iter().enumerate() {
-        new_id[t as usize] = n as u32;
-    }
-    let pick = |t: &u32| *t as usize;
-    let term_words: Vec<&[u8]> = order.iter().map(|t| term_words[pick(t)]).collect();
-    let in_bool: Vec<bool> = order.iter().map(|t| in_bool[pick(t)]).collect();
-    let df: Vec<u32> = order.iter().map(|t| df[pick(t)]).collect();
-    for phrase in &mut phrases {
-        phrase.iter_mut().for_each(|t| *t = new_id[*t as usize]);
-    }
-    for query in &mut queries {
-        if let Query::Bool(first, ops) = query {
-            *first = new_id[*first as usize];
-            ops.iter_mut().for_each(|(_, t)| *t = new_id[*t as usize]);
-        }
-    }
-    drop(vocab);
-    let vocab = Vocab::new(&term_words);
-    let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
-    let states = automaton.fail.len();
     let mut dense = vec![u32::MAX; term_count];
     let mut dense_count = 0;
     for t in 0..term_count {
         // A bitmap costs doc_count / 8 bytes; a posting costs 4 bytes, and 8 while it is collected.
-        if in_bool[t] && df[t] * 64 >= sampled_docs.max(1) {
+        if samples.iter().map(|s| s.1[t]).sum::<u32>() * 64 >= sampled_docs.max(1) {
             dense[t] = dense_count;
             dense_count += 1;
         }
@@ -588,7 +566,12 @@ fn main() {
                         let c = next.fetch_add(1, Ordering::Relaxed);
                         let Some(chunk) = chunks.get(c) else { break };
                         // Postings are filed by term range, one range per thread for the sort.
-                        let (mut postings, mut matches) = (vec![Vec::new(); threads], Vec::new());
+                        // 128 KB each, so they are mapped, not carved from the heap, and their
+                        // memory goes back to the system when the sort frees them.
+                        let (mut postings, mut matches): (Vec<Vec<u32>>, _) = (
+                            (0..threads).map(|_| Vec::with_capacity(1 << 15)).collect(),
+                            Vec::new(),
+                        );
                         // Bits for frequent terms go to a bitmap local to this chunk's documents
                         // and are merged with one atomic OR per word at the end.
                         let last = chunk[..chunk.len() - 1]
@@ -654,29 +637,27 @@ fn main() {
     let (postings, matches): (Vec<_>, Vec<_>) =
         results.into_iter().map(|(_, _, p, m)| (p, m)).unzip();
     let first = |k: usize| (k * term_count).div_ceil(threads);
+    let mut columns: Vec<Vec<(Vec<u32>, u32)>> = (0..threads).map(|_| Vec::new()).collect();
+    for (chunk, &b) in postings.into_iter().zip(&bases) {
+        for (k, list) in chunk.into_iter().enumerate() {
+            columns[k].push((list, b));
+        }
+    }
     let groups: Vec<(Vec<usize>, Vec<u32>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|k| {
-                let (postings, first, bases) = (&postings, &first, &bases);
+        let workers: Vec<_> = columns
+            .into_iter()
+            .enumerate()
+            .map(|(k, lists)| {
+                let first = &first;
                 scope.spawn(move || {
-                    let lists: Vec<(&[u32], u32)> = postings
-                        .iter()
-                        .zip(bases)
-                        .map(|(chunk, &b)| (&chunk[k][..], b))
-                        .collect();
-                    group_by_key(&lists, first(k), first(k + 1) - first(k), term_shift)
+                    group_by_key(lists, first(k), first(k + 1) - first(k), term_shift)
                 })
             })
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
-    drop(postings);
-    let matches: Vec<(&[u32], u32)> = matches
-        .iter()
-        .zip(&bases)
-        .map(|(m, &b)| (&m[..], b))
-        .collect();
-    let (state_start, state_docs) = group_by_key(&matches, 0, states, state_shift);
+    let matches: Vec<(Vec<u32>, u32)> = matches.into_iter().zip(bases).collect();
+    let (state_start, state_docs) = group_by_key(matches, 0, states, state_shift);
     let list = |t: u32| {
         let k = t as usize * threads / term_count;
         let (starts, docs) = &groups[k];
