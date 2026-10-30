@@ -57,45 +57,6 @@ fn split_lines(data: &[u8], parts: usize) -> Vec<&[u8]> {
     chunks
 }
 
-/// Calls `f(u, v, w)` for every edge line, one thread per chunk.
-fn for_each_edge(chunks: &[&[u8]], f: &(dyn Fn(u32, u32, u32) + Sync)) {
-    std::thread::scope(|scope| {
-        for &chunk in chunks {
-            scope.spawn(move || {
-                let mut p = 0;
-                while p < chunk.len() {
-                    let (u, v, w) = (
-                        number(chunk, &mut p),
-                        number(chunk, &mut p),
-                        number(chunk, &mut p),
-                    );
-                    f(u as u32, v as u32, w as u32);
-                }
-            });
-        }
-    });
-}
-
-#[derive(Clone, Copy)]
-struct SharedPtr(*mut (u32, u32));
-// SAFETY: each edge slot is claimed exactly once through an atomic cursor.
-unsafe impl Send for SharedPtr {}
-unsafe impl Sync for SharedPtr {}
-
-/// Builds the CSR edge array for `offsets`, with every node id passed through `id`.
-fn scatter(chunks: &[&[u8]], offsets: &[u32], id: &(dyn Fn(u32) -> u32 + Sync)) -> Vec<(u32, u32)> {
-    let cursor: Vec<AtomicU32> = offsets.iter().map(|&o| AtomicU32::new(o)).collect();
-    let mut edges = vec![(0u32, 0u32); *offsets.last().unwrap() as usize];
-    let ptr = SharedPtr(edges.as_mut_ptr());
-    for_each_edge(chunks, &|u, v, w| {
-        let ptr = ptr;
-        let slot = cursor[id(u) as usize].fetch_add(1, Ordering::Relaxed) as usize;
-        // SAFETY: fetch_add gives every edge a distinct slot inside its tail's range.
-        unsafe { *ptr.0.add(slot) = (id(v), w) };
-    });
-    edges
-}
-
 fn prefix_sums(counts: impl Iterator<Item = u32>) -> Vec<u32> {
     let mut offsets = vec![0u32];
     for c in counts {
@@ -197,22 +158,99 @@ fn main() {
     let m = number(graph, &mut pos) as usize;
     let chunks = split_lines(&graph[pos..], threads);
 
-    // Pass 1: out-degrees, and has_in[v] = v has an in-edge from another node, so a path from some
-    // s != v can end at v.
-    let degree: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let has_in: Vec<AtomicU64> = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
-    for_each_edge(&chunks, &|u, v, _| {
-        degree[u as usize].fetch_add(1, Ordering::Relaxed);
-        if u != v {
-            has_in[v as usize / 64].fetch_or(1 << (v % 64), Ordering::Relaxed);
+    // 1. One parse. Every thread files its edges into buckets by tail (`u >> SHIFT`, about 8k nodes
+    //    per bucket), in file order, and marks in-edges in its own bitset: only sequential writes
+    //    and a cache-sized bitset, instead of random atomics into node-sized arrays.
+    //    has_in[v]: v has an in-edge from another node, so a path from some s != v can end at v.
+    const SHIFT: usize = 13;
+    let buckets = (n >> SHIFT) + 1;
+    let parsed: Vec<(Vec<Vec<(u32, u32, u32)>>, Vec<u64>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = chunks
+            .iter()
+            .map(|&chunk| {
+                scope.spawn(move || {
+                    // An edge line is about 19 bytes; sizing the buckets up front avoids regrowing them.
+                    let per_bucket = chunk.len() / 18 / buckets + 64;
+                    let mut out: Vec<Vec<(u32, u32, u32)>> = (0..buckets)
+                        .map(|_| Vec::with_capacity(per_bucket))
+                        .collect();
+                    let mut has_in = vec![0u64; n.div_ceil(64)];
+                    let mut p = 0;
+                    while p < chunk.len() {
+                        let (u, v, w) = (
+                            number(chunk, &mut p) as u32,
+                            number(chunk, &mut p) as u32,
+                            number(chunk, &mut p) as u32,
+                        );
+                        if u != v {
+                            has_in[v as usize / 64] |= 1 << (v % 64);
+                        }
+                        out[u as usize >> SHIFT].push((u, v, w));
+                    }
+                    (out, has_in)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let has_in: Vec<u64> = (0..n.div_ceil(64))
+        .map(|i| parsed.iter().fold(0, |acc, p| acc | p.1[i]))
+        .collect();
+
+    // 2. The CSR in input ids: each bucket is counting-sorted into its own slice by one thread.
+    let bucket_start =
+        prefix_sums((0..buckets).map(|b| parsed.iter().map(|p| p.0[b].len() as u32).sum()));
+    assert_eq!(
+        bucket_start[buckets] as usize, m,
+        "edge count differs from the header"
+    );
+    let mut offsets = vec![m as u32; n + 1];
+    let mut edges = vec![(0u32, 0u32); m];
+    std::thread::scope(|scope| {
+        let (mut offsets_rest, mut edges_rest) = (&mut offsets[..n], &mut edges[..]);
+        for k in 0..threads {
+            let (first, last) = (buckets * k / threads, buckets * (k + 1) / threads);
+            let nodes = (last << SHIFT).min(n) - (first << SHIFT).min(n);
+            let (my_offsets, rest) = offsets_rest.split_at_mut(nodes);
+            offsets_rest = rest;
+            let (my_edges, rest) =
+                edges_rest.split_at_mut((bucket_start[last] - bucket_start[first]) as usize);
+            edges_rest = rest;
+            let (parsed, bucket_start) = (&parsed, &bucket_start);
+            scope.spawn(move || {
+                for b in first..last {
+                    let base = b << SHIFT;
+                    let span = ((b + 1) << SHIFT).min(n) - base.min(n);
+                    let mut cursor = vec![0u32; span + 1];
+                    for list in parsed.iter().map(|p| &p.0[b]) {
+                        for &(u, _, _) in list {
+                            cursor[u as usize - base + 1] += 1;
+                        }
+                    }
+                    for i in 0..span {
+                        cursor[i + 1] += cursor[i];
+                    }
+                    let (start, local) = (
+                        bucket_start[b],
+                        (base - (first << SHIFT)).min(my_offsets.len()),
+                    );
+                    for i in 0..span {
+                        my_offsets[local + i] = start + cursor[i];
+                    }
+                    let edge_base = (start - bucket_start[first]) as usize;
+                    for list in parsed.iter().map(|p| &p.0[b]) {
+                        for &(u, v, w) in list {
+                            let slot = &mut cursor[u as usize - base];
+                            my_edges[edge_base + *slot as usize] = (v, w);
+                            *slot += 1;
+                        }
+                    }
+                }
+            });
         }
     });
-    let degree: Vec<u32> = degree.into_iter().map(AtomicU32::into_inner).collect();
-    let offsets = prefix_sums(degree.iter().copied());
-    assert_eq!(offsets[n] as usize, m, "edge count differs from the header");
+    drop(parsed);
 
-    // Pass 2: the CSR in input ids, used only to find a breadth-first order.
-    let edges = scatter(&chunks, &offsets, &|u| u);
     // Every thread grows a breadth-first region from its own seed and claims nodes with an atomic
     // flag, so each region gets contiguous new ids. Nodes no seed reaches (islands, isolated nodes)
     // are numbered afterwards by the same search, run serially from each of them.
@@ -257,12 +295,35 @@ fn main() {
     for (new, &old) in order.iter().enumerate() {
         rank[old as usize] = new as u32;
     }
-    drop(edges);
-    let offsets = prefix_sums(order.iter().map(|&old| degree[old as usize]));
-    drop((order, degree));
-
-    // Pass 3: the CSR in breadth-first ids, the one the searches use.
-    let edges = scatter(&chunks, &offsets, &|u| rank[u as usize]);
+    // 4. The CSR in breadth-first ids, the one the searches use: each thread copies a contiguous
+    //    range of new ids from the old CSR, renaming heads on the way.
+    let new_offsets = prefix_sums(
+        order
+            .iter()
+            .map(|&old| offsets[old as usize + 1] - offsets[old as usize]),
+    );
+    let mut new_edges = vec![(0u32, 0u32); m];
+    std::thread::scope(|scope| {
+        let mut rest = &mut new_edges[..];
+        for k in 0..threads {
+            let (first, last) = (n * k / threads, n * (k + 1) / threads);
+            let (mine, tail) = rest.split_at_mut((new_offsets[last] - new_offsets[first]) as usize);
+            rest = tail;
+            let (order, offsets, edges, rank) = (&order[first..last], &offsets, &edges, &rank);
+            scope.spawn(move || {
+                let mut out = mine.iter_mut();
+                for &old in order {
+                    for &(v, w) in
+                        &edges[offsets[old as usize] as usize..offsets[old as usize + 1] as usize]
+                    {
+                        *out.next().unwrap() = (rank[v as usize], w);
+                    }
+                }
+            });
+        }
+    });
+    drop((order, edges));
+    let (offsets, edges) = (new_offsets, new_edges);
 
     // Queries, answered in parallel; answers land in their input order.
     let mut list = Vec::new();
@@ -288,8 +349,7 @@ fn main() {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed) as usize;
                     let Some(&(s, t)) = list.get(i) else { break };
-                    let reachable = s == t
-                        || has_in[t as usize / 64].load(Ordering::Relaxed) >> (t % 64) & 1 == 1;
+                    let reachable = s == t || has_in[t as usize / 64] >> (t % 64) & 1 == 1;
                     if !reachable {
                         continue;
                     }
