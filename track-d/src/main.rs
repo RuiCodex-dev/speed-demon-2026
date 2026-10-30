@@ -6,10 +6,13 @@
 //! 2. Renumber the nodes in breadth-first order: the input ids are a random relabelling, so without
 //!    this every step of a search is a cache miss. A third pass scatters the edges straight into the
 //!    renumbered CSR, after the first one has been freed.
+//!    An edge is one u32, `head << wbits | weight`; the rare weight that does not fit is kept in a
+//!    small map by (tail, head).
 //! 3. Answer the queries in parallel, one Dijkstra per query with a radix heap, stopping when the
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
 //!    Distances live in 1024-node pages taken from a per-thread pool, so a thread holds only the
 //!    pages its current search touched.
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
@@ -150,11 +153,20 @@ impl<T: Copy + Default> Dist<T> {
     }
 }
 
+/// The graph the searches use: a CSR of packed edges (see `main`) in breadth-first ids.
+struct Graph {
+    offsets: Vec<u32>,
+    edges: Vec<u32>,
+    wbits: u32,
+    big: u32,
+    /// The weights of edges stored with the marker `big`, by `tail << 32 | head`.
+    heavy: HashMap<u64, u64>,
+}
+
 /// Shortest distance from `s` to `t`: Ok(None) if `t` is unreachable, Err(()) if a distance did not
 /// fit in `T`.
 fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
-    offsets: &[u32],
-    edges: &[(u32, u32)],
+    g: &Graph,
     (s, t): (u32, u32),
     dist: &mut Dist<T>,
     heap: &mut RadixHeap,
@@ -169,8 +181,14 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
             if d + 1 > dist.get(u).into() {
                 continue; // stale entry: u was already settled closer
             }
-            for &(v, w) in &edges[offsets[u as usize] as usize..offsets[u as usize + 1] as usize] {
-                let nd = d + w as u64;
+            for &e in &g.edges[g.offsets[u as usize] as usize..g.offsets[u as usize + 1] as usize] {
+                let (v, w) = (e >> g.wbits, e & g.big);
+                let w = if w == g.big {
+                    g.heavy[&((u as u64) << 32 | v as u64)]
+                } else {
+                    w as u64
+                };
+                let nd = d + w;
                 let old = dist.get(v);
                 if old == T::default() || nd + 1 < old.into() {
                     dist.set(v, T::try_from(nd + 1).map_err(|_| ())?);
@@ -198,6 +216,12 @@ fn main() {
     let n = number(graph, &mut pos) as usize;
     let m = number(graph, &mut pos) as usize;
     let chunks = split_lines(&graph[pos..], threads);
+    // An edge is one u32, `head << wbits | weight`, the head taking the bits the node count needs.
+    // A weight that does not fit (0.07 % of the spec's edges) is stored as `big`, the all-ones
+    // marker, and kept in a map by (tail, head) instead: parallel edges matter only through their
+    // smallest weight, so that is the one kept.
+    let wbits = 32u32.saturating_sub((n.max(2) - 1).ilog2() + 1);
+    let big = (1u32 << wbits) - 1;
 
     // 1. One parse. Every thread files its edges into buckets by tail (`u >> SHIFT`, about 8k nodes
     //    per bucket), in file order, and marks in-edges in its own bitset: only sequential writes
@@ -205,38 +229,48 @@ fn main() {
     //    has_in[v]: v has an in-edge from another node, so a path from some s != v can end at v.
     const SHIFT: usize = 13;
     let buckets = (n >> SHIFT) + 1;
-    let parsed: Vec<(Vec<Vec<(u32, u32, u32)>>, Vec<u64>)> = std::thread::scope(|scope| {
-        let workers: Vec<_> = chunks
-            .iter()
-            .map(|&chunk| {
-                scope.spawn(move || {
-                    // An edge line is about 19 bytes; sizing the buckets up front avoids regrowing them.
-                    let per_bucket = chunk.len() / 18 / buckets + 64;
-                    let mut out: Vec<Vec<(u32, u32, u32)>> = (0..buckets)
-                        .map(|_| Vec::with_capacity(per_bucket))
-                        .collect();
-                    let mut has_in = vec![0u64; n.div_ceil(64)];
-                    let mut p = 0;
-                    while p < chunk.len() {
-                        let (u, v, w) = (
-                            number(chunk, &mut p) as u32,
-                            number(chunk, &mut p) as u32,
-                            number(chunk, &mut p) as u32,
-                        );
-                        if u != v {
-                            has_in[v as usize / 64] |= 1 << (v % 64);
+    let parsed: Vec<(Vec<Vec<(u32, u32)>>, Vec<u64>, Vec<(u64, u64)>)> =
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = chunks
+                .iter()
+                .map(|&chunk| {
+                    scope.spawn(move || {
+                        // An edge line is about 19 bytes; sizing the buckets up front avoids regrowing them.
+                        let per_bucket = chunk.len() / 18 / buckets + 64;
+                        let mut out: Vec<Vec<(u32, u32)>> = (0..buckets)
+                            .map(|_| Vec::with_capacity(per_bucket))
+                            .collect();
+                        let (mut has_in, mut heavy) = (vec![0u64; n.div_ceil(64)], Vec::new());
+                        let mut p = 0;
+                        while p < chunk.len() {
+                            let (u, v) =
+                                (number(chunk, &mut p) as u32, number(chunk, &mut p) as u32);
+                            let w = number(chunk, &mut p);
+                            if u != v {
+                                has_in[v as usize / 64] |= 1 << (v % 64);
+                            }
+                            if w >= big as u64 {
+                                heavy.push(((u as u64) << 32 | v as u64, w));
+                            }
+                            out[u as usize >> SHIFT]
+                                .push((u, v << wbits | w.min(big as u64) as u32));
                         }
-                        out[u as usize >> SHIFT].push((u, v, w));
-                    }
-                    (out, has_in)
+                        (out, has_in, heavy)
+                    })
                 })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).collect()
-    });
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
     let has_in: Vec<u64> = (0..n.div_ceil(64))
         .map(|i| parsed.iter().fold(0, |acc, p| acc | p.1[i]))
         .collect();
+    let mut heavy: HashMap<u64, u64> = HashMap::new();
+    for &(key, w) in parsed.iter().flat_map(|p| &p.2) {
+        heavy
+            .entry(key)
+            .and_modify(|x| *x = (*x).min(w))
+            .or_insert(w);
+    }
 
     // 2. The CSR in input ids: each bucket is counting-sorted into its own slice by one thread.
     let bucket_start =
@@ -246,7 +280,7 @@ fn main() {
         "edge count differs from the header"
     );
     let mut offsets = vec![m as u32; n + 1];
-    let mut edges = vec![(0u32, 0u32); m];
+    let mut edges = vec![0u32; m];
     std::thread::scope(|scope| {
         let (mut offsets_rest, mut edges_rest) = (&mut offsets[..n], &mut edges[..]);
         for k in 0..threads {
@@ -264,7 +298,7 @@ fn main() {
                     let span = ((b + 1) << SHIFT).min(n) - base.min(n);
                     let mut cursor = vec![0u32; span + 1];
                     for list in parsed.iter().map(|p| &p.0[b]) {
-                        for &(u, _, _) in list {
+                        for &(u, _) in list {
                             cursor[u as usize - base + 1] += 1;
                         }
                     }
@@ -280,9 +314,9 @@ fn main() {
                     }
                     let edge_base = (start - bucket_start[first]) as usize;
                     for list in parsed.iter().map(|p| &p.0[b]) {
-                        for &(u, v, w) in list {
+                        for &(u, e) in list {
                             let slot = &mut cursor[u as usize - base];
-                            my_edges[edge_base + *slot as usize] = (v, w);
+                            my_edges[edge_base + *slot as usize] = e;
                             *slot += 1;
                         }
                     }
@@ -297,7 +331,9 @@ fn main() {
     // are numbered afterwards by the same search, run serially from each of them.
     let claimed: Vec<AtomicBool> = (0..n).map(|_| AtomicBool::new(false)).collect();
     let grow = |seed: u32, region: &mut Vec<u32>| {
-        if claimed[seed as usize].load(Ordering::Relaxed) || claimed[seed as usize].swap(true, Ordering::Relaxed) {
+        if claimed[seed as usize].load(Ordering::Relaxed)
+            || claimed[seed as usize].swap(true, Ordering::Relaxed)
+        {
             return;
         }
         let mut head = region.len();
@@ -305,7 +341,10 @@ fn main() {
         while head < region.len() {
             let u = region[head] as usize;
             head += 1;
-            for &(v, _) in &edges[offsets[u] as usize..offsets[u + 1] as usize] {
+            for v in edges[offsets[u] as usize..offsets[u + 1] as usize]
+                .iter()
+                .map(|e| e >> wbits)
+            {
                 if !claimed[v as usize].load(Ordering::Relaxed)
                     && !claimed[v as usize].swap(true, Ordering::Relaxed)
                 {
@@ -343,7 +382,7 @@ fn main() {
             .iter()
             .map(|&old| offsets[old as usize + 1] - offsets[old as usize]),
     );
-    let mut new_edges = vec![(0u32, 0u32); m];
+    let mut new_edges = vec![0u32; m];
     std::thread::scope(|scope| {
         let mut rest = &mut new_edges[..];
         for k in 0..threads {
@@ -354,17 +393,25 @@ fn main() {
             scope.spawn(move || {
                 let mut out = mine.iter_mut();
                 for &old in order {
-                    for &(v, w) in
+                    for &e in
                         &edges[offsets[old as usize] as usize..offsets[old as usize + 1] as usize]
                     {
-                        *out.next().unwrap() = (rank[v as usize], w);
+                        *out.next().unwrap() = rank[(e >> wbits) as usize] << wbits | e & big;
                     }
                 }
             });
         }
     });
     drop((order, edges));
-    let (offsets, edges) = (new_offsets, new_edges);
+    let rename =
+        |key: u64| (rank[(key >> 32) as usize] as u64) << 32 | rank[key as u32 as usize] as u64;
+    let graph = Graph {
+        offsets: new_offsets,
+        edges: new_edges,
+        wbits,
+        big,
+        heavy: heavy.into_iter().map(|(key, w)| (rename(key), w)).collect(),
+    };
 
     // Queries, answered in parallel; answers land in their input order.
     let mut list = Vec::new();
@@ -392,18 +439,20 @@ fn main() {
                     last: 0,
                 };
                 loop {
-                    let Some(&i) = by_source.get(next.fetch_add(1, Ordering::Relaxed) as usize) else { break };
+                    let Some(&i) = by_source.get(next.fetch_add(1, Ordering::Relaxed) as usize)
+                    else {
+                        break;
+                    };
                     let (s, t) = list[i];
                     let reachable = s == t || has_in[t as usize / 64] >> (t % 64) & 1 == 1;
                     if !reachable {
                         continue;
                     }
                     let query = (rank[s as usize], rank[t as usize]);
-                    let answer =
-                        shortest(&offsets, &edges, query, &mut dist, &mut heap).or_else(|_| {
-                            let wide = wide.get_or_insert_with(|| Dist::<u64>::new(n));
-                            shortest(&offsets, &edges, query, wide, &mut heap)
-                        });
+                    let answer = shortest(&graph, query, &mut dist, &mut heap).or_else(|_| {
+                        let wide = wide.get_or_insert_with(|| Dist::<u64>::new(n));
+                        shortest(&graph, query, wide, &mut heap)
+                    });
                     if let Ok(Some(d)) = answer {
                         answers[i].store(d, Ordering::Relaxed);
                     }
