@@ -1,13 +1,17 @@
 //! Speed Demon 2026, Track D (Traverse).
 //!
-//! 1. Map `graph.txt` and parse the edge lines in parallel chunks.
-//! 2. Build a compressed adjacency array (CSR): out-degrees with atomic counters, a prefix sum,
-//!    then every thread scatters its edges into their tail's slice.
-//! 3. Answer the queries in parallel: one Dijkstra per query with a binary heap, stopping when the
-//!    target is settled. Each thread keeps one distance array and resets only the nodes it touched.
+//! 1. Map `graph.txt`. A first parallel pass counts out-degrees and marks which nodes have an
+//!    in-edge from another node; a second pass scatters the edges into a compressed adjacency
+//!    array (CSR). No intermediate edge list is kept.
+//! 2. Renumber the nodes in breadth-first order: the input ids are a random relabelling, so without
+//!    this every step of a search is a cache miss. A third pass scatters the edges straight into the
+//!    renumbered CSR, after the first one has been freed.
+//! 3. Answer the queries in parallel, one Dijkstra per query with a binary heap, stopping when the
+//!    target is settled. A target with no in-edge from another node is unreachable without a search.
+//!    Each thread keeps one distance array and resets only the nodes the last search touched.
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -55,13 +59,55 @@ fn split_lines(data: &[u8], parts: usize) -> Vec<&[u8]> {
     chunks
 }
 
+/// Calls `f(u, v, w)` for every edge line, one thread per chunk.
+fn for_each_edge(chunks: &[&[u8]], f: &(dyn Fn(u32, u32, u32) + Sync)) {
+    std::thread::scope(|scope| {
+        for &chunk in chunks {
+            scope.spawn(move || {
+                let mut p = 0;
+                while p < chunk.len() {
+                    let (u, v, w) = (
+                        number(chunk, &mut p),
+                        number(chunk, &mut p),
+                        number(chunk, &mut p),
+                    );
+                    f(u as u32, v as u32, w as u32);
+                }
+            });
+        }
+    });
+}
+
 #[derive(Clone, Copy)]
 struct SharedPtr(*mut (u32, u32));
 // SAFETY: each edge slot is claimed exactly once through an atomic cursor.
 unsafe impl Send for SharedPtr {}
 unsafe impl Sync for SharedPtr {}
 
-/// Shortest distance from `s` to `t`, or None. `dist` is all-MAX on entry and on return.
+/// Builds the CSR edge array for `offsets`, with every node id passed through `id`.
+fn scatter(chunks: &[&[u8]], offsets: &[u32], id: &(dyn Fn(u32) -> u32 + Sync)) -> Vec<(u32, u32)> {
+    let cursor: Vec<AtomicU32> = offsets.iter().map(|&o| AtomicU32::new(o)).collect();
+    let mut edges = vec![(0u32, 0u32); *offsets.last().unwrap() as usize];
+    let ptr = SharedPtr(edges.as_mut_ptr());
+    for_each_edge(chunks, &|u, v, w| {
+        let ptr = ptr;
+        let slot = cursor[id(u) as usize].fetch_add(1, Ordering::Relaxed) as usize;
+        // SAFETY: fetch_add gives every edge a distinct slot inside its tail's range.
+        unsafe { *ptr.0.add(slot) = (id(v), w) };
+    });
+    edges
+}
+
+fn prefix_sums(counts: impl Iterator<Item = u32>) -> Vec<u32> {
+    let mut offsets = vec![0u32];
+    for c in counts {
+        offsets.push(offsets.last().unwrap() + c);
+    }
+    offsets
+}
+
+/// Shortest distance from `s` to `t`, or None if `t` is not reachable. `dist` is all-MAX on entry
+/// and on return; only the entries a search touched are reset.
 fn shortest(
     offsets: &[u32],
     edges: &[(u32, u32)],
@@ -76,12 +122,12 @@ fn shortest(
     heap.push(Reverse((0u64, s)));
     let mut answer = None;
     while let Some(Reverse((d, u))) = heap.pop() {
-        if d > dist[u as usize] {
-            continue; // stale entry: u was already settled closer
-        }
         if u == t {
             answer = Some(d);
             break;
+        }
+        if d > dist[u as usize] {
+            continue; // stale entry: u was already settled closer
         }
         for &(v, w) in &edges[offsets[u as usize] as usize..offsets[u as usize + 1] as usize] {
             let nd = d + w as u64;
@@ -112,73 +158,24 @@ fn main() {
     let mut pos = 0;
     let n = number(graph, &mut pos) as usize;
     let m = number(graph, &mut pos) as usize;
-    let chunks = split_lines(&graph[pos..], threads * 4);
+    let chunks = split_lines(&graph[pos..], threads);
 
-    // Pass 1: parse every chunk into (tail, head, weight) and count out-degrees.
-    let degree: Vec<AtomicU32> = (0..n + 1).map(|_| AtomicU32::new(0)).collect();
-    // has_in[v]: v has an in-edge from another node, so a path from some s != v can end at v.
-    let has_in: Vec<std::sync::atomic::AtomicU64> =
-        (0..n.div_ceil(64)).map(|_| Default::default()).collect();
-    let parsed: Vec<Vec<(u32, u32, u32)>> = std::thread::scope(|scope| {
-        let workers: Vec<_> = chunks
-            .iter()
-            .map(|&chunk| {
-                let (degree, has_in) = (&degree, &has_in);
-                scope.spawn(move || {
-                    let mut out = Vec::with_capacity(chunk.len() / 16);
-                    let mut p = 0;
-                    while p < chunk.len() {
-                        let (u, v, w) = (
-                            number(chunk, &mut p),
-                            number(chunk, &mut p),
-                            number(chunk, &mut p),
-                        );
-                        degree[u as usize].fetch_add(1, Ordering::Relaxed);
-                        if u != v {
-                            has_in[v as usize / 64].fetch_or(1 << (v % 64), Ordering::Relaxed);
-                        }
-                        out.push((u as u32, v as u32, w as u32));
-                    }
-                    out
-                })
-            })
-            .collect();
-        workers.into_iter().map(|w| w.join().unwrap()).collect()
-    });
-    assert_eq!(
-        parsed.iter().map(Vec::len).sum::<usize>(),
-        m,
-        "edge count differs from the header"
-    );
-
-    // CSR: offsets[u]..offsets[u+1] are u's out-edges. `cursor` hands out slots during the scatter.
-    let mut offsets = vec![0u32; n + 1];
-    let mut total = 0u32;
-    for u in 0..n {
-        offsets[u] = total;
-        total += degree[u].load(Ordering::Relaxed);
-    }
-    offsets[n] = total;
-    let cursor: Vec<AtomicU32> = offsets.iter().map(|&o| AtomicU32::new(o)).collect();
-    let mut edges = vec![(0u32, 0u32); m];
-    let edges_ptr = SharedPtr(edges.as_mut_ptr());
-    std::thread::scope(|scope| {
-        for part in &parsed {
-            let cursor = &cursor;
-            scope.spawn(move || {
-                let ptr = edges_ptr;
-                for &(u, v, w) in part {
-                    let slot = cursor[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
-                    // SAFETY: fetch_add gives every edge a distinct slot inside u's range.
-                    unsafe { *ptr.0.add(slot) = (v, w) };
-                }
-            });
+    // Pass 1: out-degrees, and has_in[v] = v has an in-edge from another node, so a path from some
+    // s != v can end at v.
+    let degree: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let has_in: Vec<AtomicU64> = (0..n.div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
+    for_each_edge(&chunks, &|u, v, _| {
+        degree[u as usize].fetch_add(1, Ordering::Relaxed);
+        if u != v {
+            has_in[v as usize / 64].fetch_or(1 << (v % 64), Ordering::Relaxed);
         }
     });
-    drop(parsed);
+    let degree: Vec<u32> = degree.into_iter().map(AtomicU32::into_inner).collect();
+    let offsets = prefix_sums(degree.iter().copied());
+    assert_eq!(offsets[n] as usize, m, "edge count differs from the header");
 
-    // Renumber nodes in breadth-first order so that a search touches nearby memory: the input ids
-    // are a random relabelling, which makes every distance and adjacency access a cache miss.
+    // Pass 2: the CSR in input ids, used only to find a breadth-first order.
+    let edges = scatter(&chunks, &offsets, &|u| u);
     let mut rank = vec![u32::MAX; n];
     let mut order: Vec<u32> = Vec::with_capacity(n);
     for root in 0..n as u32 {
@@ -199,34 +196,12 @@ fn main() {
             }
         }
     }
-    let mut new_offsets = vec![0u32; n + 1];
-    for (i, &old) in order.iter().enumerate() {
-        new_offsets[i + 1] = new_offsets[i] + offsets[old as usize + 1] - offsets[old as usize];
-    }
-    // Rebuild the adjacency in the new numbering, one contiguous range of new ids per thread.
-    let mut new_edges = vec![(0u32, 0u32); m];
-    std::thread::scope(|scope| {
-        let mut rest = &mut new_edges[..];
-        let mut first = 0;
-        for k in 1..=threads {
-            let last = n * k / threads;
-            let (mine, tail) = rest.split_at_mut((new_offsets[last] - new_offsets[first]) as usize);
-            rest = tail;
-            let (order, offsets, edges, rank) = (&order[first..last], &offsets, &edges, &rank);
-            scope.spawn(move || {
-                let mut dst = mine.iter_mut();
-                for &old in order {
-                    for &(v, w) in
-                        &edges[offsets[old as usize] as usize..offsets[old as usize + 1] as usize]
-                    {
-                        *dst.next().unwrap() = (rank[v as usize], w);
-                    }
-                }
-            });
-            first = last;
-        }
-    });
-    let (offsets, edges) = (new_offsets, new_edges);
+    drop(edges);
+    let offsets = prefix_sums(order.iter().map(|&old| degree[old as usize]));
+    drop((order, degree));
+
+    // Pass 3: the CSR in breadth-first ids, the one the searches use.
+    let edges = scatter(&chunks, &offsets, &|u| rank[u as usize]);
 
     // Queries, answered in parallel; answers land in their input order.
     let mut list = Vec::new();
@@ -237,41 +212,39 @@ fn main() {
             number(queries, &mut p) as u32,
         ));
     }
-    let answers: Vec<AtomicU64Opt> = (0..list.len()).map(|_| AtomicU64Opt::default()).collect();
-    let next = AtomicUsize::new(0);
+    let answers: Vec<AtomicU64> = (0..list.len()).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let next = AtomicU32::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads.min(list.len()) {
             scope.spawn(|| {
-                let mut dist = vec![u64::MAX; n];
-                let mut touched = Vec::new();
+                let (mut dist, mut touched) = (vec![u64::MAX; n], Vec::new());
                 loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let i = next.fetch_add(1, Ordering::Relaxed) as usize;
                     let Some(&(s, t)) = list.get(i) else { break };
                     let reachable = s == t
                         || has_in[t as usize / 64].load(Ordering::Relaxed) >> (t % 64) & 1 == 1;
-                    let (s, t) = (rank[s as usize], rank[t as usize]);
-                    let answer = if reachable {
-                        shortest(&offsets, &edges, s, t, &mut dist, &mut touched)
-                    } else {
-                        None
-                    };
-                    answers[i]
-                        .0
-                        .store(answer.unwrap_or(u64::MAX), Ordering::Relaxed);
+                    if reachable {
+                        if let Some(d) = shortest(
+                            &offsets,
+                            &edges,
+                            rank[s as usize],
+                            rank[t as usize],
+                            &mut dist,
+                            &mut touched,
+                        ) {
+                            answers[i].store(d, Ordering::Relaxed);
+                        }
+                    }
                 }
             });
         }
     });
     let mut out = String::with_capacity(list.len() * 12);
     for answer in &answers {
-        match answer.0.load(Ordering::Relaxed) {
-            u64::MAX => out.push_str("-1\n"),
+        match answer.load(Ordering::Relaxed) {
+            u64::MAX => out.push_str("-1\n"), // a real distance is below 2^63
             d => out.push_str(&format!("{d}\n")),
         }
     }
     std::fs::write(format!("{out_dir}/distances.txt"), out).expect("cannot write output");
 }
-
-/// An answer slot; u64::MAX means unreachable (a real distance is below 2^63).
-#[derive(Default)]
-struct AtomicU64Opt(std::sync::atomic::AtomicU64);
