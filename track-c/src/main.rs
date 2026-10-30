@@ -110,23 +110,22 @@ const EMPTY: Totals = Totals {
     note_bytes: 0,
 };
 
-/// Name -> id, shared by all threads without locks. A name's id is the index of its slot, and the
-/// slot holds everything needed to check it: `tag << 48 | length << 32 | arena offset`, where `tag`
-/// is the top of the name's hash and the offset is never 0, so 0 marks an empty slot. One random
-/// read for the slot and one for the arena copy; the table and arena come zeroed from calloc, so
-/// pages the run never touches cost no memory.
+/// Name -> id, shared by all threads without locks. A slot holds `tag << 32 | (id + 1)` (0 = empty),
+/// where `tag` is the high half of the name's hash; `spans[id]` says where the arena holds the
+/// name's bytes. All three arrays are zero-allocated, so pages the run never touches cost no memory.
 struct Names {
     slots: Vec<AtomicU64>,
-    /// Start of a zeroed buffer twice as long as the input, leaked: every name plus padding fits.
+    spans: Vec<AtomicU64>,
+    /// Start of a zeroed buffer as long as the input, leaked: every name fits in it.
     arena: *mut u8,
+    next_id: AtomicUsize,
     arena_used: AtomicUsize,
-    inserted: AtomicUsize,
     /// Set when the table is too full to be trusted; the run is then repeated with a bigger one.
     full: AtomicBool,
 }
 
 // SAFETY: the arena is written only in ranges handed out by `arena_used.fetch_add`, each to one
-// thread, and read only after the slot that names the range was published with Release.
+// thread, and read only after the span that names the range was published with Release.
 unsafe impl Sync for Names {}
 
 /// A zeroed vector of atomics straight from `calloc`, so its pages cost memory only once written.
@@ -138,60 +137,59 @@ fn zeroed_atomics(n: usize) -> Vec<AtomicU64> {
 
 impl Names {
     fn new(capacity: usize, arena_bytes: usize) -> Names {
-        assert!(
-            arena_bytes < 1 << 32,
-            "input too large for 32-bit arena offsets"
-        );
         Names {
             slots: zeroed_atomics(capacity),
-            arena: vec![0u8; arena_bytes + 8].leak().as_mut_ptr(),
-            arena_used: AtomicUsize::new(8), // offset 0 is never used, so a slot is never 0
-            inserted: AtomicUsize::new(0),
+            spans: zeroed_atomics(capacity),
+            arena: vec![0u8; arena_bytes.max(1)].leak().as_mut_ptr(),
+            next_id: AtomicUsize::new(0),
+            arena_used: AtomicUsize::new(0),
             full: AtomicBool::new(false),
+        }
+    }
+
+    fn bytes(&self, id: usize) -> &[u8] {
+        let span = self.spans[id].load(Ordering::Acquire);
+        // SAFETY: the span was published after its bytes were written (see `id`).
+        unsafe {
+            std::slice::from_raw_parts(
+                self.arena.add((span >> 16) as usize),
+                (span & 0xFFFF) as usize,
+            )
         }
     }
 
     fn id(&self, name: &[u8]) -> usize {
         let h = hash(name);
-        let len = u64::try_from(name.len())
-            .ok()
-            .filter(|&l| l < 1 << 16)
-            .expect("name longer than 64 KiB");
-        let (tag, mask) = (h >> 48, self.slots.len() - 1);
+        let (tag, mask) = (h >> 32, self.slots.len() - 1);
         let mut i = h as usize & mask;
         loop {
             let mut slot = self.slots[i].load(Ordering::Acquire);
             if slot == 0 {
-                // Copy the bytes to arena space nobody else owns, then try to publish the slot.
+                // Claim an id and arena space, publish the bytes, then try to take the slot.
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if id >= self.slots.len() / 2 {
+                    self.full.store(true, Ordering::Relaxed);
+                    return 0;
+                }
                 let at = self.arena_used.fetch_add(name.len() + 8, Ordering::Relaxed); // + padding for `word`
                 // SAFETY: `at..at + len` was handed to this thread alone by the fetch_add above, and
-                // nobody reads it before the slot naming it is published with Release.
+                // nobody reads it before the span below is published with Release.
                 unsafe {
                     std::ptr::copy_nonoverlapping(name.as_ptr(), self.arena.add(at), name.len())
                 };
+                self.spans[id].store((at as u64) << 16 | name.len() as u64, Ordering::Release);
                 match self.slots[i].compare_exchange(
                     0,
-                    tag << 48 | len << 32 | at as u64,
+                    tag << 32 | (id as u64 + 1),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => {
-                        if self.inserted.fetch_add(1, Ordering::Relaxed) >= self.slots.len() / 2 {
-                            self.full.store(true, Ordering::Relaxed);
-                        }
-                        return i;
-                    }
-                    Err(other) => slot = other, // another thread won this slot; this copy stays unused
+                    Ok(_) => return id,
+                    Err(other) => slot = other, // another thread won this slot; its id stays unused
                 }
             }
-            if slot >> 48 == tag && (slot >> 32 & 0xFFFF) == len {
-                // SAFETY: the slot was published after its bytes were written.
-                let known = unsafe {
-                    std::slice::from_raw_parts(self.arena.add(slot as u32 as usize), name.len())
-                };
-                if same(known, name) {
-                    return i;
-                }
+            if slot >> 32 == tag && same(self.bytes((slot as u32 - 1) as usize), name) {
+                return (slot as u32 - 1) as usize;
             }
             i = (i + 1) & mask;
         }
@@ -424,9 +422,9 @@ fn main() {
     // The name table starts at 2^18 slots (half of them usable), which the spec's pool of 100,000
     // names fits; if a dataset has more distinct names, the run is repeated with 4 times as many.
     let mut capacity = 1 << 18;
-    let (totals, seen, words) = loop {
+    let (totals, names, seen, words) = loop {
         let names = Names::new(capacity, data.len() * 2); // names + 8 bytes of padding each
-        let words = capacity / 64;
+        let words = capacity / 2 / 64;
         let seen = zeroed_atomics(words * keys.len());
         let next = AtomicUsize::new(0);
         let totals: Vec<Vec<Totals>> = std::thread::scope(|scope| {
@@ -456,10 +454,11 @@ fn main() {
             workers.into_iter().map(|w| w.join().unwrap()).collect()
         });
         if !names.full.load(Ordering::Relaxed) {
-            break (totals, seen, words);
+            break (totals, names, seen, words);
         }
         capacity *= 4;
     };
+    let used_words = names.next_id.load(Ordering::Relaxed).div_ceil(64);
 
     let mut out = Vec::new();
     for (c, key) in keys.iter().enumerate() {
@@ -476,7 +475,7 @@ fn main() {
         if t.count == 0 {
             continue;
         }
-        let distinct: u32 = seen[c * words..(c + 1) * words]
+        let distinct: u32 = seen[c * words..c * words + used_words]
             .iter()
             .map(|w| w.load(Ordering::Relaxed).count_ones())
             .sum();
