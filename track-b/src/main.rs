@@ -7,11 +7,13 @@
 //!    Phrases are matched in the same pass: an Aho-Corasick automaton over term ids finds every phrase
 //!    query in a document's token stream, so a phrase answer is a ready-made list.
 //! 3. A counting sort over the chunks, in chunk order, makes every list sorted by doc id.
-//! 4. BOOL queries are sorted-list merges applied left to right.
+//!    Terms that a sample shows to be frequent get a bitmap over all documents instead of a list.
+//! 4. BOOL queries are sorted-list merges applied left to right, or bitmap operations when a term
+//!    is stored as a bitmap.
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
@@ -323,13 +325,37 @@ fn push_num(out: &mut Vec<u8>, mut value: u64) {
     out.extend_from_slice(&buf[i..]);
 }
 
+/// Calls `f(doc_id, text)` for every line of a piece of `docs.txt` that holds whole lines.
+fn for_each_doc(lines: &[u8], mut f: impl FnMut(u32, &[u8])) {
+    let mut p = 0;
+    while p < lines.len() {
+        let tab = p + lines[p..].iter().position(|&b| b == b'\t').unwrap();
+        let end = tab + lines[tab..].iter().position(|&b| b == b'\n').unwrap();
+        f(
+            lines[p..tab]
+                .iter()
+                .fold(0u32, |acc, &b| acc * 10 + (b - b'0') as u32),
+            &lines[tab + 1..end],
+        );
+        p = end + 1;
+    }
+}
+
+/// Moves `pos` forward to the start of the next line (or the end of `data`).
+fn line_start(data: &[u8], mut pos: usize) -> usize {
+    while pos > 0 && pos < data.len() && data[pos - 1] != b'\n' {
+        pos += 1;
+    }
+    pos.min(data.len())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data_dir = args.get(1).map_or("/data", |s| s.as_str());
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
 
-    // 1. Queries and their vocabulary. Only terms used by a BOOL query need posting lists.
+    // 1. Queries and their vocabulary. Only terms used by a BOOL query need document sets.
     let query_text = map_file(&format!("{data_dir}/queries.txt"));
     let mut terms: FxMap<&'static [u8], u32> = FxMap::default();
     let mut in_bool: Vec<bool> = Vec::new();
@@ -373,8 +399,67 @@ fn main() {
     let (automaton, phrase_end) = Phrases::build(&phrases, term_count);
     let states = automaton.fail.len();
 
-    // 2. Parallel corpus scan: BOOL postings and phrase matches, each once per document.
+    // 2. Frequent BOOL terms get a bitmap over all documents instead of a posting list. A sample of
+    //    about 1/64 of the corpus, spread over the file, estimates each term's document frequency;
+    //    a wrong guess changes only the representation, never an answer.
     let docs = map_file(&format!("{data_dir}/docs.txt"));
+    let last_line = docs[..docs.len().saturating_sub(1)]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    let doc_count = if docs.is_empty() {
+        0
+    } else {
+        docs[last_line..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .fold(0, |acc, &b| acc * 10 + (b - b'0') as usize)
+            + 1
+    };
+    let words = doc_count.div_ceil(64);
+    let samples: Vec<(u32, Vec<u32>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|k| {
+                let (vocab, in_bool) = (&vocab, &in_bool);
+                scope.spawn(move || {
+                    let start = line_start(docs, docs.len() * k / threads);
+                    let end = line_start(docs, start + docs.len() / threads / 64);
+                    let (mut seen_docs, mut df, mut last) =
+                        (0u32, vec![0u32; term_count], vec![u32::MAX; term_count]);
+                    for_each_doc(&docs[start..end], |doc, text| {
+                        seen_docs += 1;
+                        tokens(text, |token, h| {
+                            if let Some(t) = vocab
+                                .get(token, h)
+                                .filter(|&t| in_bool[t as usize] && last[t as usize] != doc)
+                            {
+                                last[t as usize] = doc;
+                                df[t as usize] += 1;
+                            }
+                        });
+                    });
+                    (seen_docs, df)
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
+    });
+    let sampled_docs: u32 = samples.iter().map(|s| s.0).sum();
+    let mut dense = vec![u32::MAX; term_count];
+    let mut dense_count = 0;
+    for t in 0..term_count {
+        // A bitmap costs doc_count / 8 bytes; a posting list costs 4 bytes per document.
+        if samples.iter().map(|s| s.1[t]).sum::<u32>() * 32 >= sampled_docs.max(1) {
+            dense[t] = dense_count;
+            dense_count += 1;
+        }
+    }
+    let bitmaps: Vec<AtomicU64> = (0..dense_count as usize * words)
+        .map(|_| AtomicU64::new(0))
+        .collect();
+
+    // 3. Parallel corpus scan: bitmap bits or postings for BOOL terms, and phrase matches, each
+    //    once per document.
     let chunks = split_lines(docs, threads * 16);
     let next = AtomicUsize::new(0);
     let mut results: Vec<(usize, Vec<Vec<(u32, u32)>>, Vec<(u32, u32)>)> =
@@ -391,23 +476,24 @@ fn main() {
                             // Postings are filed by term range, one range per thread for the sort.
                             let (mut postings, mut matches) =
                                 (vec![Vec::new(); threads], Vec::new());
-                            let mut p = 0;
-                            while p < chunk.len() {
-                                let tab = p + chunk[p..].iter().position(|&b| b == b'\t').unwrap();
-                                let end =
-                                    tab + chunk[tab..].iter().position(|&b| b == b'\n').unwrap();
-                                let doc = chunk[p..tab]
-                                    .iter()
-                                    .fold(0u32, |acc, &b| acc * 10 + (b - b'0') as u32);
+                            for_each_doc(chunk, |doc, text| {
                                 let mut state = 0;
-                                tokens(&chunk[tab + 1..end], |token, h| {
+                                tokens(text, |token, h| {
                                     let Some(t) = vocab.get(token, h) else {
                                         state = 0; // no phrase contains a word that is not a query term
                                         return;
                                     };
                                     if in_bool[t as usize] && last_doc[t as usize] != doc {
                                         last_doc[t as usize] = doc;
-                                        postings[t as usize * threads / term_count].push((t, doc));
+                                        match dense[t as usize] {
+                                            u32::MAX => postings[t as usize * threads / term_count]
+                                                .push((t, doc)),
+                                            d => {
+                                                let word = &bitmaps
+                                                    [d as usize * words + doc as usize / 64];
+                                                word.fetch_or(1 << (doc % 64), Ordering::Relaxed);
+                                            }
+                                        }
                                     }
                                     state = automaton.step(state, t);
                                     let mut hit = automaton.out[state as usize];
@@ -419,8 +505,7 @@ fn main() {
                                         hit = automaton.out[automaton.fail[hit as usize] as usize];
                                     }
                                 });
-                                p = end + 1;
-                            }
+                            });
                             done.push((c, postings, matches));
                         }
                         done
@@ -433,8 +518,9 @@ fn main() {
                 .collect()
         });
     results.sort_unstable_by_key(|r| r.0);
+    let bitmaps: Vec<u64> = bitmaps.into_iter().map(AtomicU64::into_inner).collect();
 
-    // 3. Counting sorts, in chunk order, so every list is ascending. Thread k sorts the terms
+    // 4. Counting sorts, in chunk order, so every list is ascending. Thread k sorts the terms
     //    `first(k)..first(k + 1)`, which is exactly what the scan filed under k.
     let (postings, matches): (Vec<_>, Vec<_>) = results.into_iter().map(|(_, p, m)| (p, m)).unzip();
     let first = |k: usize| (k * term_count).div_ceil(threads);
@@ -459,42 +545,118 @@ fn main() {
         let (starts, docs) = &groups[k];
         &docs[starts[t as usize - first(k)]..starts[t as usize - first(k) + 1]]
     };
+    // Applies `op` with term `t` to a bitmap result, whichever way `t` is stored.
+    let apply = |r: &mut Vec<u64>, op: u8, t: u32| match dense[t as usize] {
+        u32::MAX => {
+            let docs = list(t);
+            match op {
+                b'A' => {
+                    let mut kept = vec![0u64; words];
+                    for &d in docs
+                        .iter()
+                        .filter(|&&d| r[d as usize / 64] >> (d % 64) & 1 == 1)
+                    {
+                        kept[d as usize / 64] |= 1 << (d % 64);
+                    }
+                    *r = kept;
+                }
+                b'O' => docs
+                    .iter()
+                    .for_each(|&d| r[d as usize / 64] |= 1 << (d % 64)),
+                _ => docs
+                    .iter()
+                    .for_each(|&d| r[d as usize / 64] &= !(1 << (d % 64))),
+            }
+        }
+        d => {
+            let bits = &bitmaps[d as usize * words..(d as usize + 1) * words];
+            for (x, &b) in r.iter_mut().zip(bits) {
+                *x = match op {
+                    b'A' => *x & b,
+                    b'O' => *x | b,
+                    _ => *x & !b,
+                };
+            }
+        }
+    };
 
-    // 4. Answer the queries in parallel, in contiguous ranges so the output stays in order.
+    // 5. Answer the queries in parallel, in contiguous ranges so the output stays in order. A BOOL
+    //    query that touches a bitmap term is evaluated on bitmaps, any other one on sorted lists.
     let parts: Vec<Vec<u8>> = std::thread::scope(|scope| {
         let workers: Vec<_> = (0..threads)
             .map(|k| {
-                let (queries, phrase_end, state_start, state_docs, list) =
-                    (&queries, &phrase_end, &state_start, &state_docs, &list);
+                let (queries, phrase_end, state_start, state_docs, list, apply, dense) = (
+                    &queries,
+                    &phrase_end,
+                    &state_start,
+                    &state_docs,
+                    &list,
+                    &apply,
+                    &dense,
+                );
                 scope.spawn(move || {
                     let mut text = Vec::new();
                     for query in
                         &queries[queries.len() * k / threads..queries.len() * (k + 1) / threads]
                     {
                         let owned;
-                        let result: &[u32] = match query {
-                            Query::Bool(first, ops) if ops.is_empty() => list(*first),
-                            Query::Bool(first, ops) => {
-                                let mut r = list(*first).to_vec();
+                        let (count, sum, smallest): (usize, u64, Vec<u32>) = match query {
+                            Query::Bool(first, ops)
+                                if std::iter::once(first)
+                                    .chain(ops.iter().map(|o| &o.1))
+                                    .any(|&t| dense[t as usize] != u32::MAX) =>
+                            {
+                                let mut r = vec![0u64; words];
+                                apply(&mut r, b'O', *first);
                                 for &(op, t) in ops {
-                                    r = match op {
-                                        b'A' => intersect(&r, list(t)),
-                                        b'O' => union(&r, list(t)),
-                                        _ => difference(&r, list(t)),
-                                    };
+                                    apply(&mut r, op, t);
                                 }
-                                owned = r;
-                                &owned
+                                let (mut count, mut sum, mut smallest) = (0, 0, Vec::new());
+                                for (i, &w) in r.iter().enumerate() {
+                                    let mut w = w;
+                                    while w != 0 {
+                                        let d = i as u32 * 64 + w.trailing_zeros();
+                                        count += 1;
+                                        sum += d as u64;
+                                        if smallest.len() < 10 {
+                                            smallest.push(d);
+                                        }
+                                        w &= w - 1;
+                                    }
+                                }
+                                (count, sum, smallest)
                             }
-                            Query::Phrase(i) => {
-                                let s = phrase_end[*i as usize] as usize;
-                                &state_docs[state_start[s]..state_start[s + 1]]
+                            _ => {
+                                let result: &[u32] = match query {
+                                    Query::Bool(first, ops) if ops.is_empty() => list(*first),
+                                    Query::Bool(first, ops) => {
+                                        let mut r = list(*first).to_vec();
+                                        for &(op, t) in ops {
+                                            r = match op {
+                                                b'A' => intersect(&r, list(t)),
+                                                b'O' => union(&r, list(t)),
+                                                _ => difference(&r, list(t)),
+                                            };
+                                        }
+                                        owned = r;
+                                        &owned
+                                    }
+                                    Query::Phrase(i) => {
+                                        let s = phrase_end[*i as usize] as usize;
+                                        &state_docs[state_start[s]..state_start[s + 1]]
+                                    }
+                                };
+                                (
+                                    result.len(),
+                                    result.iter().map(|&d| d as u64).sum(),
+                                    result.iter().take(10).copied().collect(),
+                                )
                             }
                         };
-                        push_num(&mut text, result.len() as u64);
+                        push_num(&mut text, count as u64);
                         text.push(b' ');
-                        push_num(&mut text, result.iter().map(|&d| d as u64).sum());
-                        for &d in result.iter().take(10) {
+                        push_num(&mut text, sum);
+                        for d in smallest {
                             text.push(b' ');
                             push_num(&mut text, d as u64);
                         }
