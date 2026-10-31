@@ -426,6 +426,13 @@ fn main() {
         while head < region.len() {
             let u = region[head] as usize;
             head += 1;
+            // The queue is random in old ids: request offsets 16 nodes ahead and edge rows 8 ahead.
+            if let Some(&w) = region.get(head + 16) {
+                fetch(&offsets[w as usize]);
+            }
+            if let Some(&w) = region.get(head + 8) {
+                fetch(edges.as_ptr().wrapping_add(offsets[w as usize] as usize));
+            }
             for v in edges[offsets[u] as usize..offsets[u + 1] as usize]
                 .iter()
                 .map(|e| e >> wbits)
