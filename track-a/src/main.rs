@@ -11,6 +11,7 @@
 //!    small scratch buffer and the nearest-rank percentiles come from `select_nth_unstable`.
 //! 4. The latencies are freed, then the text is formatted and written. The output's page cache
 //!    counts as memory, so no phase holds the records, the latencies and the text together.
+use std::arch::x86_64::*;
 use std::io::Write;
 
 unsafe extern "C" {
@@ -56,7 +57,6 @@ fn hash(name: &[u8]) -> u64 {
 /// start inside the name and never faults on the others; a lane can end up to 3 bytes past the
 /// name, which the padding of a copy and the rest of an input line (>= 7 bytes) cover.
 fn same(a: &[u8], b: &[u8]) -> bool {
-    use std::arch::x86_64::*;
     let starts = unsafe { _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28) };
     a.len() == b.len()
         && (0..a.len()).step_by(32).all(|i| {
@@ -68,19 +68,13 @@ fn same(a: &[u8], b: &[u8]) -> bool {
                 let y = _mm256_maskload_epi32(b.as_ptr().add(i) as *const i32, lanes);
                 _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32
             };
-            let want = if rest >= 32 {
-                u32::MAX
-            } else {
-                (1 << rest) - 1
-            };
+            let want = u32::MAX >> (32 - rest.min(32)); // rest >= 1
             equal & want == want
         })
 }
 
-/// Index of the first space at or after `i`, testing 32 bytes at a time where 32 bytes remain and
-/// then 8 at a time.
+/// Index of the first space at or after `i`, testing 32 bytes at a time where 32 bytes remain.
 fn find_space(s: &[u8], mut i: usize) -> usize {
-    use std::arch::x86_64::*;
     while i + 32 <= s.len() {
         // SAFETY: AVX2 is enabled at build time (x86-64-v3), and the 32 bytes are inside `s`.
         let spaces = unsafe {
@@ -92,15 +86,7 @@ fn find_space(s: &[u8], mut i: usize) -> usize {
         }
         i += 32;
     }
-    while let Some(word) = s.get(i..i + 8) {
-        let w = u64::from_le_bytes(word.try_into().unwrap()) ^ 0x2020_2020_2020_2020;
-        let zero = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
-        if zero != 0 {
-            return i + zero.trailing_zeros() as usize / 8; // the lowest zero byte is exact
-        }
-        i += 8;
-    }
-    i + s[i..].iter().position(|&b| b == b' ').unwrap()
+    i + s[i..].iter().position(|&b| b == b' ').unwrap() // the last 31 bytes of a chunk
 }
 
 /// The decimal at `s[i..]`, which ends at the first byte below '0', and its length. Up to 7 digits
