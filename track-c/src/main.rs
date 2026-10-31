@@ -1,10 +1,8 @@
 //! Speed Demon 2026, Track C (Join).
 //!
 //! 1. `regions.csv` becomes a dense array: region id -> country index (countries sorted bytewise).
-//! 2. `records.csv` is memory-mapped and cut into chunks. Quotes only occur in quoted fields and
-//!    `""` escapes come in pairs (spec 2.1), so a byte is inside quotes exactly when an odd number of
-//!    `"` precede it: a parallel quote count plus a prefix parity tells every chunk where it starts,
-//!    and the chunk then begins after its first record terminator outside quotes.
+//! 2. `records.csv` is memory-mapped and cut into chunks. The generator writes a CR only as the
+//!    first byte of a CRLF terminator (spec 2.2), so each chunk begins after the first CR past its cut.
 //! 3. Each thread parses its records with a byte state machine and keeps per-country totals.
 //! 4. Distinct names: one lock-free table shared by all threads maps each name to an id. It keeps a
 //!    copy of every distinct name in a compact arena, so the exact byte comparison reads memory that
@@ -448,39 +446,13 @@ fn main() {
     let cuts: Vec<usize> = (0..=parts)
         .map(|i| body + (data.len() - body) * i / parts)
         .collect();
-    let quotes: Vec<usize> = std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads)
-            .map(|k| {
-                let cuts = &cuts;
-                scope.spawn(move || {
-                    (parts * k / threads..parts * (k + 1) / threads)
-                        .map(|i| {
-                            data[cuts[i]..cuts[i + 1]]
-                                .iter()
-                                .filter(|&&b| b == b'"')
-                                .count()
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| w.join().unwrap())
-            .collect()
-    });
-    // Each cut moves forward to just after the first terminator outside quotes.
+    // Each cut moves forward to just after the next CR: the generator writes a CR only as the first
+    // byte of a CRLF terminator, never inside quotes (spec 2.2), so every CR ends a record.
     let mut starts = vec![body];
-    let mut parity = 0;
-    for i in 1..parts {
-        parity += quotes[i - 1];
-        let mut inside = parity % 2 == 1;
-        let mut p = cuts[i];
-        while p < data.len() && (inside || data[p] != b'\n') {
-            inside ^= data[p] == b'"';
-            p += 1;
-        }
-        starts.push((p + 1).min(data.len()).max(*starts.last().unwrap()));
+    for &cut in &cuts[1..parts] {
+        let cut = cut.max(*starts.last().unwrap());
+        let cr = data[cut..].iter().position(|&b| b == b'\r');
+        starts.push(cr.map_or(data.len(), |i| (cut + i + 2).min(data.len())));
     }
     starts.push(data.len());
 
