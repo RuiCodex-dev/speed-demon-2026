@@ -319,12 +319,12 @@ fn main() {
     });
 
     // Phase 2: one sorted endpoint list (byte order), the hour range, and dense group ids.
-    let mut names: Vec<&'static [u8]> = shards
-        .iter()
+    // Every thread saw most endpoints: drop the duplicates before sorting.
+    let unique: std::collections::HashSet<&'static [u8]> = (shards.iter())
         .flat_map(|s| s.endpoints.names.iter().map(|e| e.0))
         .collect();
+    let mut names: Vec<&'static [u8]> = unique.into_iter().collect();
     names.sort_unstable();
-    names.dedup();
     let lo = shards.iter().map(|s| s.hours.0).min().unwrap();
     let hi = shards.iter().map(|s| s.hours.1).max().unwrap();
     let groups = (hi - lo + 1) as usize * names.len();
