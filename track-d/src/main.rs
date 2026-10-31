@@ -183,13 +183,13 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
         let one = T::try_from(1).map_err(|_| ())?;
         dist.set(s, one);
         heap.push(one, s);
-        // A node can be popped again later with a larger key (6 % of pops here). Relaxing from it
-        // again is harmless, since every distance it offers is a real path, and cheaper than
-        // reading `dist[u]` on every pop to skip it.
         while let Some((key, u)) = heap.pop() {
             let d = key.into() - 1;
             if u == t {
                 return Ok(Some(d));
+            }
+            if key.into() > dist.get(u).into() {
+                continue; // stale entry: u was already settled closer
             }
             for &e in &g.edges[g.offsets[u as usize] as usize..g.offsets[u as usize + 1] as usize] {
                 let (v, w) = (e >> g.wbits, e & g.big);
