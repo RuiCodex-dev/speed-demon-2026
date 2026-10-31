@@ -8,11 +8,12 @@
 //!    renumbered CSR, after the first one has been freed.
 //!    An edge is one u32, `head << wbits | weight`; the rare weight that does not fit is kept in a
 //!    small map by (tail, head).
-//! 3. Answer the queries in parallel, one Dijkstra per query with a radix heap, stopping when the
+//! 3. Answer the queries in parallel, one Dijkstra per query with a bucket queue, stopping when the
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
 //!    Distances live in 1024-node pages taken from a per-thread pool, so a thread holds only the
 //!    pages its current search touched.
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
@@ -69,45 +70,55 @@ fn prefix_sums(counts: impl Iterator<Item = u32>) -> Vec<u32> {
     offsets
 }
 
-/// Radix heap: a priority queue for integer keys that never go below the last key popped, which
-/// Dijkstra guarantees. Bucket i holds the keys whose highest bit that differs from `last` is bit
-/// i - 1, so a pop only rescans one bucket and every entry moves down at most 64 times. Keys are
-/// stored as `K` (u32 for the u32 searches), so an entry is 8 bytes there instead of 16.
-struct RadixHeap<K> {
-    buckets: Vec<Vec<(K, u32)>>,
-    last: u64,
+/// Bucket queue for Dijkstra's keys, which are integers that never go below the last key popped.
+/// A ring of `RING` buckets holds the keys in [cur, cur + RING), so a push is one append and the
+/// key is implied by the bucket; a key further ahead (only the rare edges heavier than `RING`)
+/// waits in a binary heap until the ring reaches it.
+const RING: u64 = 2048;
+struct Queue {
+    ring: Vec<Vec<u32>>,
+    cur: u64,
+    count: usize,
+    far: BinaryHeap<Reverse<(u64, u32)>>,
 }
 
-impl<K: Copy + Into<u64>> RadixHeap<K> {
+impl Queue {
     fn new() -> Self {
-        RadixHeap {
-            buckets: (0..65).map(|_| Vec::new()).collect(),
-            last: 0,
+        Queue {
+            ring: (0..RING).map(|_| Vec::new()).collect(),
+            cur: 0,
+            count: 0,
+            far: BinaryHeap::new(),
         }
     }
-    fn bucket(&self, key: K) -> usize {
-        64 - (key.into() ^ self.last).leading_zeros() as usize
+    fn push(&mut self, key: u64, node: u32) {
+        if key < self.cur + RING {
+            self.ring[(key % RING) as usize].push(node);
+            self.count += 1;
+        } else {
+            self.far.push(Reverse((key, node)));
+        }
     }
-    fn push(&mut self, key: K, node: u32) {
-        let b = self.bucket(key);
-        self.buckets[b].push((key, node));
-    }
-    fn pop(&mut self) -> Option<(K, u32)> {
-        if self.buckets[0].is_empty() {
-            let i = self.buckets.iter().position(|b| !b.is_empty())?;
-            let mut moved = std::mem::take(&mut self.buckets[i]);
-            self.last = moved.iter().map(|e| e.0.into()).min().unwrap();
-            for &(key, node) in &moved {
-                self.push(key, node); // always lands in a bucket below i
+    fn pop(&mut self) -> Option<(u64, u32)> {
+        loop {
+            if let Some(node) = self.ring[(self.cur % RING) as usize].pop() {
+                self.count -= 1;
+                return Some((self.cur, node));
             }
-            moved.clear();
-            self.buckets[i] = moved; // keep the allocation
+            self.cur = if self.count > 0 { self.cur + 1 } else { self.far.peek()?.0.0 };
+            while let Some(&Reverse((key, node))) = self.far.peek()
+                && key < self.cur + RING
+            {
+                self.far.pop();
+                self.ring[(key % RING) as usize].push(node);
+                self.count += 1;
+            }
         }
-        self.buckets[0].pop()
     }
     fn clear(&mut self) {
-        self.buckets.iter_mut().for_each(Vec::clear);
-        self.last = 0;
+        self.ring.iter_mut().for_each(Vec::clear);
+        (self.cur, self.count) = (0, 0);
+        self.far.clear();
     }
 }
 
@@ -176,19 +187,18 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
     g: &Graph,
     (s, t): (u32, u32),
     dist: &mut Dist<T>,
-    heap: &mut RadixHeap<T>,
+    heap: &mut Queue,
 ) -> Result<Option<u64>, ()> {
     // Heap keys are distances + 1, like the entries of `dist`.
     let mut search = || {
-        let one = T::try_from(1).map_err(|_| ())?;
-        dist.set(s, one);
-        heap.push(one, s);
+        dist.set(s, T::try_from(1).map_err(|_| ())?);
+        heap.push(1, s);
         while let Some((key, u)) = heap.pop() {
-            let d = key.into() - 1;
+            let d = key - 1;
             if u == t {
                 return Ok(Some(d));
             }
-            if key.into() > dist.get(u).into() {
+            if key > dist.get(u).into() {
                 continue; // stale entry: u was already settled closer
             }
             for &e in &g.edges[g.offsets[u as usize] as usize..g.offsets[u as usize + 1] as usize] {
@@ -201,9 +211,8 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
                 let nd = d + w;
                 let old = dist.get(v);
                 if old == T::default() || nd + 1 < old.into() {
-                    let key = T::try_from(nd + 1).map_err(|_| ())?;
-                    dist.set(v, key);
-                    heap.push(key, v);
+                    dist.set(v, T::try_from(nd + 1).map_err(|_| ())?);
+                    heap.push(nd + 1, v);
                 }
             }
         }
@@ -462,7 +471,7 @@ fn main() {
             scope.spawn(|| {
                 // u32 distances halve the per-thread array; a search that overflows them (only the
                 // spec's near-2^32 weights do) is repeated with a u64 array made on first need.
-                let (mut dist, mut heap, mut wide) = (Dist::<u32>::new(n), RadixHeap::new(), None);
+                let (mut dist, mut heap, mut wide) = (Dist::<u32>::new(n), Queue::new(), None);
                 loop {
                     let Some(&i) = by_source.get(next.fetch_add(1, Ordering::Relaxed) as usize)
                     else {
@@ -476,7 +485,7 @@ fn main() {
                     let query = (rank[s as usize], rank[t as usize]);
                     let answer = shortest(&graph, query, &mut dist, &mut heap).or_else(|_| {
                         let (dist, heap) =
-                            wide.get_or_insert_with(|| (Dist::new(n), RadixHeap::new()));
+                            wide.get_or_insert_with(|| (Dist::new(n), Queue::new()));
                         shortest::<u64>(&graph, query, dist, heap)
                     });
                     if let Ok(Some(d)) = answer {
