@@ -300,7 +300,9 @@ fn main() {
                             + ranks[(*r >> 32) as u16 as usize];
                         *r = group << 33 | (*r >> 48 & 1) << 32 | (*r as u32 as u64);
                     }
-                    shard.records.sort_unstable();
+                    // By group only: percentiles are selected later, so the order inside a group
+                    // does not matter, and equal keys are cheap for pdqsort.
+                    shard.records.sort_unstable_by_key(|r| r >> 33);
                     let (n, mut runs) = (shard.records.len(), Vec::<[u32; 4]>::new());
                     let at = shard.records.as_mut_ptr();
                     for i in 0..n {

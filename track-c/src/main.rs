@@ -93,9 +93,9 @@ const EMPTY: Totals = Totals {
 
 /// Name -> id, shared by all threads without locks. A slot holds `tag:10 | id + 1:22 | offset:32`
 /// (0 = empty): `tag` is the top of the name's hash and `offset` points into the arena, where the
-/// name is stored as a 2-byte length followed by its bytes and 8 bytes of padding. A lookup reads the
-/// slot and then one arena line. Ids stay dense, so the per-country bitsets stay small. The table and
-/// the arena come zeroed from calloc, so pages the run never touches cost no memory.
+/// name is stored as a 2-byte length followed by its bytes, padded to a multiple of 8 bytes. A
+/// lookup reads the slot and then one arena line. Ids stay dense, so the per-country bitsets stay
+/// small. The table and the arena come zeroed from calloc, so untouched pages cost no memory.
 struct Names {
     slots: Vec<AtomicU64>,
     /// Start of a zeroed buffer three times as long as the input, leaked: every name fits in it.
@@ -164,7 +164,7 @@ impl Names {
                 }
                 let at = self
                     .arena_used
-                    .fetch_add(2 + name.len() + 8, Ordering::Relaxed);
+                    .fetch_add(2 + name.len().next_multiple_of(8), Ordering::Relaxed);
                 // SAFETY: `at..at + 2 + len` was handed to this thread alone by the fetch_add above,
                 // and nobody reads it before the slot naming it is published with Release.
                 unsafe {
@@ -228,7 +228,22 @@ fn text_field(data: &'static [u8], p: &mut usize) -> (&'static [u8], usize) {
     }
 }
 
+/// The decimal at `*p`, which ends at the first byte below '0' (`,`, `.` or a terminator); leaves
+/// `*p` on that byte. Up to 7 digits come from one 8-byte load: one SWAR test finds the end and
+/// the digits are combined pairwise, with no branch per digit.
 fn integer(data: &[u8], p: &mut usize) -> u64 {
+    if let Some(bytes) = data.get(*p..*p + 8) {
+        let x = u64::from_le_bytes(bytes.try_into().unwrap());
+        let stop = x.wrapping_sub(0x3030_3030_3030_3030) & !x & 0x8080_8080_8080_8080;
+        let len = stop.trailing_zeros() as usize / 8; // 8 when no end in sight
+        if (1..8).contains(&len) {
+            *p += len;
+            let d = (x & 0x0F0F_0F0F_0F0F_0F0F) << (64 - 8 * len);
+            let d = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+            let d = (d * 100 + (d >> 16)) & 0x0000_FFFF_0000_FFFF;
+            return (d * 10000 + (d >> 32)) & 0xFFFF_FFFF;
+        }
+    }
     let mut value = 0;
     while data[*p].is_ascii_digit() {
         value = value * 10 + (data[*p] - b'0') as u64;
