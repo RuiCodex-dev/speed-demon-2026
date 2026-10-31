@@ -69,6 +69,7 @@ fn find_space(s: &[u8], mut i: usize) -> usize {
 }
 
 /// A thread's endpoint -> local id table: open addressing, comparing the stored hash before bytes.
+/// The names are copies, each followed by 8 bytes of padding for `word`.
 struct Endpoints {
     slots: Vec<u32>, // 0 = empty, otherwise local id + 1
     names: Vec<(&'static [u8], u64)>,
@@ -86,7 +87,10 @@ impl Endpoints {
             }
             i = (i + 1) & mask;
         }
-        self.names.push((name, h));
+        // Keep a padded copy: comparing against the name's first line in the 239 MB input was a
+        // cache miss on every lookup, while ~2,000 copies stay in cache.
+        let copy = Vec::leak([name, &[0; 8]].concat());
+        self.names.push((&copy[..name.len()], h));
         self.slots[i] = self.names.len() as u32;
         if self.names.len() * 2 > self.slots.len() {
             let mut bigger = Endpoints {
