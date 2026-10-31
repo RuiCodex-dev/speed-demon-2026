@@ -52,13 +52,46 @@ fn hash(name: &[u8]) -> u64 {
     (word(name, 0) ^ last.rotate_left(29) ^ name.len() as u64).wrapping_mul(0x517cc1b727220a95)
 }
 
-/// Byte equality of two endpoints, 8 bytes at a time.
+/// Byte equality of two endpoints, 32 bytes at a time. `maskload` reads only the 4-byte lanes that
+/// start inside the name and never faults on the others; a lane can end up to 3 bytes past the
+/// name, which the padding of a copy and the rest of an input line (>= 7 bytes) cover.
 fn same(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && (0..a.len()).step_by(8).all(|i| word(a, i) == word(b, i))
+    use std::arch::x86_64::*;
+    let starts = unsafe { _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28) };
+    a.len() == b.len()
+        && (0..a.len()).step_by(32).all(|i| {
+            let rest = a.len() - i;
+            // SAFETY: AVX2 is enabled at build time (x86-64-v3); the loads are bounded as above.
+            let equal = unsafe {
+                let lanes = _mm256_cmpgt_epi32(_mm256_set1_epi32(rest.min(32) as i32), starts);
+                let x = _mm256_maskload_epi32(a.as_ptr().add(i) as *const i32, lanes);
+                let y = _mm256_maskload_epi32(b.as_ptr().add(i) as *const i32, lanes);
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32
+            };
+            let want = if rest >= 32 {
+                u32::MAX
+            } else {
+                (1 << rest) - 1
+            };
+            equal & want == want
+        })
 }
 
-/// Index of the first space at or after `i`, testing 8 bytes at a time where 8 bytes remain.
+/// Index of the first space at or after `i`, testing 32 bytes at a time where 32 bytes remain and
+/// then 8 at a time.
 fn find_space(s: &[u8], mut i: usize) -> usize {
+    use std::arch::x86_64::*;
+    while i + 32 <= s.len() {
+        // SAFETY: AVX2 is enabled at build time (x86-64-v3), and the 32 bytes are inside `s`.
+        let spaces = unsafe {
+            let x = _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(b' ' as i8))) as u32
+        };
+        if spaces != 0 {
+            return i + spaces.trailing_zeros() as usize;
+        }
+        i += 32;
+    }
     while let Some(word) = s.get(i..i + 8) {
         let w = u64::from_le_bytes(word.try_into().unwrap()) ^ 0x2020_2020_2020_2020;
         let zero = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
