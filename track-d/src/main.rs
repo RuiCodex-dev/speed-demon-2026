@@ -127,7 +127,11 @@ impl Queue {
                 self.count -= 1;
                 return Some((self.cur, node));
             }
-            self.cur = if self.count > 0 { self.cur + 1 } else { self.far.peek()?.0.0 };
+            self.cur = if self.count > 0 {
+                self.cur + 1
+            } else {
+                self.far.peek()?.0.0
+            };
             while let Some(&Reverse((key, node))) = self.far.peek()
                 && key < self.cur + RING
             {
@@ -233,7 +237,11 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
             // and the offsets of the one after it. A prefetch never faults, whatever the address.
             let fetch = |p: *const u32| unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) };
             if let Some(v) = heap.ahead(0) {
-                fetch(g.edges.as_ptr().wrapping_add(g.offsets[v as usize] as usize));
+                fetch(
+                    g.edges
+                        .as_ptr()
+                        .wrapping_add(g.offsets[v as usize] as usize),
+                );
                 fetch(dist.slot(v));
             }
             if let Some(v) = heap.ahead(1) {
@@ -347,7 +355,10 @@ fn main() {
     // The lists by bucket, so each CSR thread owns (and frees) the ones it places.
     let mut by_bucket: Vec<Vec<Vec<(u32, u32)>>> = (0..buckets).map(|_| Vec::new()).collect();
     for (lists, _, _) in parsed {
-        lists.into_iter().zip(&mut by_bucket).for_each(|(list, b)| b.push(list));
+        lists
+            .into_iter()
+            .zip(&mut by_bucket)
+            .for_each(|(list, b)| b.push(list));
     }
     let mut offsets = vec![m as u32; n + 1];
     let mut edges = vec![0u32; m];
@@ -547,8 +558,7 @@ fn main() {
                     };
                     let Some(query) = list[i] else { continue };
                     let answer = shortest(&graph, query, &mut dist, &mut heap).or_else(|_| {
-                        let (dist, heap) =
-                            wide.get_or_insert_with(|| (Dist::new(n), Queue::new()));
+                        let (dist, heap) = wide.get_or_insert_with(|| (Dist::new(n), Queue::new()));
                         shortest::<u64>(&graph, query, dist, heap)
                     });
                     if let Ok(Some(d)) = answer {

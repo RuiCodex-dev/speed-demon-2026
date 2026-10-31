@@ -378,7 +378,10 @@ fn main() {
     let regions = map_file(&format!("{data_dir}/regions.csv"));
     let mut region_code: Vec<u16> = Vec::new();
     let mut present = [false; 26 * 26 * 26];
-    let mut p = regions.iter().position(|&b| b == b'\n').map_or(regions.len(), |i| i + 1);
+    let mut p = regions
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(regions.len(), |i| i + 1);
     while p < regions.len() {
         let region = integer(regions, &mut p) as usize;
         let code = (regions[p + 1..p + 4].iter()).fold(0, |acc, &b| acc * 26 + (b - b'A') as usize);
@@ -393,7 +396,11 @@ fn main() {
     let mut rank = [u16::MAX; 26 * 26 * 26];
     for code in (0..rank.len()).filter(|&c| present[c]) {
         rank[code] = keys.len() as u16;
-        keys.push([code / 676, code / 26 % 26, code % 26].map(|d| b'A' + d as u8).to_vec());
+        keys.push(
+            [code / 676, code / 26 % 26, code % 26]
+                .map(|d| b'A' + d as u8)
+                .to_vec(),
+        );
     }
     let unmatched = keys.len() as u16;
     let country_of: Vec<u16> = (region_code.iter())
