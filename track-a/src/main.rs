@@ -31,8 +31,9 @@ fn map_file(path: &str) -> &'static [u8] {
 }
 
 /// The 8 bytes of an endpoint starting at `i`, with bytes past its end masked to zero. An endpoint
-/// is always followed by at least 7 more bytes of its line (" 200 0\n" is the shortest tail), so an
-/// 8-byte read from any position inside it stays inside the mapping.
+/// in the input is always followed by at least 7 more bytes of its line (" 200 0\n" is the
+/// shortest tail), and a stored copy by 8 bytes of padding, so an 8-byte read from any position
+/// inside it stays inside its buffer.
 fn word(name: &[u8], i: usize) -> u64 {
     // SAFETY: see above; `name` is a slice of the mapped file with that tail after it.
     let w = unsafe { std::ptr::read_unaligned(name.as_ptr().add(i) as *const u64) };
