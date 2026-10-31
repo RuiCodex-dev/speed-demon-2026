@@ -153,6 +153,11 @@ impl Queue {
     }
 }
 
+/// Asks for the cache line holding `*p`. A prefetch never faults, whatever the address.
+fn fetch(p: *const u32) {
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) };
+}
+
 /// Entries per page of `Dist`.
 const PAGE: usize = 1024;
 
@@ -234,8 +239,7 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
                 return Ok(Some(d));
             }
             // Start loading what the next two pops will read: the next node's edges and distance,
-            // and the offsets of the one after it. A prefetch never faults, whatever the address.
-            let fetch = |p: *const u32| unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) };
+            // and the offsets of the one after it.
             if let Some(v) = heap.ahead(0) {
                 fetch(
                     g.edges
@@ -489,7 +493,22 @@ fn main() {
             let (order, offsets, edges, rank) = (&order[first..last], &offsets, &edges, &rank);
             scope.spawn(move || {
                 let mut out = mine.iter_mut();
-                for &old in order {
+                let row = |old: u32| &edges[offsets[old as usize] as usize..];
+                for (i, &old) in order.iter().enumerate() {
+                    // The order is random in old ids: request the offsets 16 nodes ahead, the edge
+                    // row 8 ahead and the ranks of the heads 4 ahead, so the misses overlap.
+                    if let Some(&v) = order.get(i + 16) {
+                        fetch(&offsets[v as usize]);
+                    }
+                    if let Some(&v) = order.get(i + 8) {
+                        fetch(row(v).as_ptr());
+                    }
+                    if let Some(&v) = order.get(i + 4) {
+                        let n = (offsets[v as usize + 1] - offsets[v as usize]) as usize;
+                        row(v)[..n]
+                            .iter()
+                            .for_each(|e| fetch(&rank[(e >> wbits) as usize]));
+                    }
                     for &e in
                         &edges[offsets[old as usize] as usize..offsets[old as usize + 1] as usize]
                     {

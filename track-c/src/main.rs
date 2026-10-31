@@ -403,13 +403,18 @@ fn main() {
         );
     }
     let unmatched = keys.len() as u16;
-    let country_of: Vec<u16> = (region_code.iter())
-        .map(|&c| rank.get(c as usize).map_or(unmatched, |&r| r))
-        .collect();
+    let mut country_of = region_code;
+    for c in country_of.iter_mut() {
+        *c = rank.get(*c as usize).map_or(unmatched, |&r| r);
+    }
     // With up to 255 countries the map is one byte per region (1 MB for the spec's ids), which stays
-    // in the scoring CPU's L2 cache; the per-record lookup was a cache miss at two bytes.
+    // in the scoring CPU's L2 cache; the per-record lookup was a cache miss at two bytes. The
+    // two-byte map is then freed.
     let small_map: Vec<u8> = if keys.len() < 255 {
-        country_of.iter().map(|&c| c as u8).collect()
+        std::mem::take(&mut country_of)
+            .iter()
+            .map(|&c| c as u8)
+            .collect()
     } else {
         Vec::new()
     };
