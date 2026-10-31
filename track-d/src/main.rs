@@ -46,6 +46,26 @@ fn number(data: &[u8], pos: &mut usize) -> u64 {
     value
 }
 
+/// `number` for up to 7 digits at once: load 8 bytes, find the first byte below '0' (the separator)
+/// and combine the digits pairwise with three multiplications. Longer numbers (only the rare heavy
+/// weights) and the last 8 bytes of `data` go through `number`.
+fn number8(data: &[u8], pos: &mut usize) -> u64 {
+    let Some(bytes) = data.get(*pos..*pos + 8) else {
+        return number(data, pos);
+    };
+    let x = u64::from_le_bytes(bytes.try_into().unwrap());
+    let stop = x.wrapping_sub(0x3030_3030_3030_3030) & !x & 0x8080_8080_8080_8080;
+    if stop == 0 {
+        return number(data, pos);
+    }
+    let len = stop.trailing_zeros() / 8; // 1..=7 digits, first digit in the lowest byte
+    *pos += len as usize + 1;
+    let d = (x & 0x0F0F_0F0F_0F0F_0F0F) << (64 - 8 * len);
+    let d = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+    let d = (d * 100 + (d >> 16)) & 0x0000_FFFF_0000_FFFF;
+    (d * 10000 + (d >> 32)) & 0xFFFF_FFFF
+}
+
 /// Splits `data` into about `parts` pieces that each end with a newline.
 fn split_lines(data: &[u8], parts: usize) -> Vec<&[u8]> {
     let mut chunks = Vec::new();
@@ -284,8 +304,8 @@ fn main() {
                         let mut p = 0;
                         while p < chunk.len() {
                             let (u, v) =
-                                (number(chunk, &mut p) as u32, number(chunk, &mut p) as u32);
-                            let w = number(chunk, &mut p);
+                                (number8(chunk, &mut p) as u32, number8(chunk, &mut p) as u32);
+                            let w = number8(chunk, &mut p);
                             if u != v {
                                 has_in[v as usize / 64] |= 1 << (v % 64);
                             }
