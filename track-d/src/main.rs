@@ -12,6 +12,7 @@
 //!    target is settled. A target with no in-edge from another node is unreachable without a search.
 //!    Distances live in 1024-node pages taken from a per-thread pool, so a thread holds only the
 //!    pages its current search touched.
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -115,6 +116,11 @@ impl Queue {
             }
         }
     }
+    /// The node `k + 1` pops ahead, if it is already in the current bucket.
+    fn ahead(&self, k: usize) -> Option<u32> {
+        let bucket = &self.ring[(self.cur % RING) as usize];
+        bucket.len().checked_sub(k + 1).map(|i| bucket[i])
+    }
     fn clear(&mut self) {
         self.ring.iter_mut().for_each(Vec::clear);
         (self.cur, self.count) = (0, 0);
@@ -147,6 +153,10 @@ impl<T: Copy + Default> Dist<T> {
     }
     fn get(&self, v: u32) -> T {
         self.pool[self.page[v as usize / PAGE] as usize * PAGE + v as usize % PAGE]
+    }
+    fn slot(&self, v: u32) -> *const u32 {
+        let i = self.page[v as usize / PAGE] as usize * PAGE + v as usize % PAGE;
+        self.pool.as_ptr().wrapping_add(i) as *const u32
     }
     fn set(&mut self, v: u32, d: T) {
         let p = v as usize / PAGE;
@@ -197,6 +207,16 @@ fn shortest<T: Copy + Into<u64> + TryFrom<u64> + PartialEq + Default>(
             let d = key - 1;
             if u == t {
                 return Ok(Some(d));
+            }
+            // Start loading what the next two pops will read: the next node's edges and distance,
+            // and the offsets of the one after it. A prefetch never faults, whatever the address.
+            let fetch = |p: *const u32| unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) };
+            if let Some(v) = heap.ahead(0) {
+                fetch(g.edges.as_ptr().wrapping_add(g.offsets[v as usize] as usize));
+                fetch(dist.slot(v));
+            }
+            if let Some(v) = heap.ahead(1) {
+                fetch(&g.offsets[v as usize]);
             }
             if key > dist.get(u).into() {
                 continue; // stale entry: u was already settled closer
