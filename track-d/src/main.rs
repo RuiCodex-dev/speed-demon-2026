@@ -287,12 +287,13 @@ fn main() {
     // 1. One parse. Every thread files its edges into buckets by tail (`u >> SHIFT`, about 32k
     //    nodes per bucket), in file order, and marks in-edges in its own bitset: only sequential
     //    writes and a cache-sized bitset, instead of random atomics into node-sized arrays.
-    //    A bucket is ~75 KB per thread; with the mmap threshold below that, each is its own
-    //    mapping, so the CSR build can hand its memory back as soon as the bucket is placed.
-    unsafe { mallopt(-3, 64 << 10) }; // M_MMAP_THRESHOLD
     //    has_in[v]: v has an in-edge from another node, so a path from some s != v can end at v.
+    //    With the mmap threshold at half a bucket's expected size (~64 KB at 12 threads), every
+    //    bucket is its own mapping, so the CSR build hands its memory back once it is placed.
     const SHIFT: usize = 15;
     let buckets = (n >> SHIFT) + 1;
+    let bucket_bytes = 8 * (graph.len() / 18 / threads / buckets + 64);
+    unsafe { mallopt(-3, (bucket_bytes / 2).clamp(4096, 1 << 20) as i32) }; // M_MMAP_THRESHOLD
     let parsed: Vec<(Vec<Vec<(u32, u32)>>, Vec<u64>, Vec<(u64, u64)>)> =
         std::thread::scope(|scope| {
             let workers: Vec<_> = chunks
