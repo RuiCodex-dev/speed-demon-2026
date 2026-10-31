@@ -44,11 +44,11 @@ fn word(name: &[u8], i: usize) -> u64 {
     }
 }
 
-/// FxHash-style hash of an endpoint: one rotate, xor and multiply per 8 bytes, no copying.
+/// Hash of an endpoint from its first and last 8 bytes and its length: constant work per line, and
+/// endpoints sharing a long prefix still differ at the end. Equality is always checked in full.
 fn hash(name: &[u8]) -> u64 {
-    (0..name.len()).step_by(8).fold(name.len() as u64, |h, i| {
-        (h.rotate_left(5) ^ word(name, i)).wrapping_mul(0x517cc1b727220a95)
-    })
+    let last = word(name, name.len().saturating_sub(8));
+    (word(name, 0) ^ last.rotate_left(29) ^ name.len() as u64).wrapping_mul(0x517cc1b727220a95)
 }
 
 /// Byte equality of two endpoints, 8 bytes at a time.
@@ -67,6 +67,27 @@ fn find_space(s: &[u8], mut i: usize) -> usize {
         i += 8;
     }
     i + s[i..].iter().position(|&b| b == b' ').unwrap()
+}
+
+/// The decimal at `s[i..]`, which ends at the first byte below '0', and its length. Up to 7 digits
+/// come from one 8-byte load: find the end with one SWAR test, combine digits pairwise.
+fn number(s: &[u8], i: usize) -> (u64, usize) {
+    if let Some(bytes) = s.get(i..i + 8) {
+        let x = u64::from_le_bytes(bytes.try_into().unwrap());
+        let stop = x.wrapping_sub(0x3030_3030_3030_3030) & !x & 0x8080_8080_8080_8080;
+        let len = stop.trailing_zeros() as usize / 8; // 8 when no end in sight
+        if (1..8).contains(&len) {
+            let d = (x & 0x0F0F_0F0F_0F0F_0F0F) << (64 - 8 * len);
+            let d = (d * 10 + (d >> 8)) & 0x00FF_00FF_00FF_00FF;
+            let d = (d * 100 + (d >> 16)) & 0x0000_FFFF_0000_FFFF;
+            return ((d * 10000 + (d >> 32)) & 0xFFFF_FFFF, len);
+        }
+    }
+    let len = s[i..].iter().position(|&b| b < b'0').unwrap();
+    let value = s[i..i + len]
+        .iter()
+        .fold(0, |v, &b| v * 10 + (b - b'0') as u64);
+    (value, len)
 }
 
 /// A thread's endpoint -> local id table: open addressing, comparing the stored hash before bytes.
@@ -163,11 +184,13 @@ fn parse(chunk: &'static [u8], base_hour: i64) -> Shard {
         records: Vec::with_capacity(chunk.len() / 70),
         hours: (u64::MAX, 0),
     };
-    let (mut p, mut last_prefix, mut hour_bits) = (0, &chunk[..0], 0u64);
+    // The hour is the first 13 bytes, compared as two overlapping 8-byte words.
+    let prefix = |line: &[u8]| (word(line, 0), word(&line[5..], 0));
+    let (mut p, mut last_prefix, mut hour_bits) = (0, (0, 0), 0u64);
     while p < chunk.len() {
         let line = &chunk[p..];
-        if &line[..13] != last_prefix {
-            last_prefix = &line[..13];
+        if prefix(line) != last_prefix {
+            last_prefix = prefix(line);
             let rel = hour_of(line) - base_hour + HOUR_BIAS;
             assert!(
                 (0..2 * HOUR_BIAS).contains(&rel),
@@ -182,16 +205,11 @@ fn parse(chunk: &'static [u8], base_hour: i64) -> Shard {
         let endpoint = &line[i + 1..j];
         let id = shard.endpoints.id(endpoint);
         let error = (line[j + 1] == b'5') as u64;
-        let mut k = j + 5;
-        let mut latency = 0u64;
-        while line[k] != b'\n' {
-            latency = latency * 10 + (line[k] - b'0') as u64;
-            k += 1;
-        }
+        let (latency, len) = number(line, j + 5);
         shard
             .records
             .push(hour_bits | error << 48 | (id as u64) << 32 | latency);
-        p += k + 1;
+        p += j + 5 + len + 1;
     }
     shard
 }
