@@ -8,7 +8,7 @@
 //!    copy of every distinct name in a compact arena, so the exact byte comparison reads memory that
 //!    stays in cache, never the 200 MB input. Each record then sets the bit (country, id).
 //!    Nothing is stored per record.
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+use std::arch::x86_64::*;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -58,15 +58,18 @@ fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && (0..a.len()).step_by(8).all(|i| word(a, i) == word(b, i))
 }
 
-/// Index of the first `"` at or after `i`, testing 8 bytes at a time where 8 bytes remain.
+/// Index of the first `"` at or after `i`, testing 32 bytes at a time where 32 bytes remain.
 fn find_quote(s: &[u8], mut i: usize) -> usize {
-    while let Some(bytes) = s.get(i..i + 8) {
-        let w = u64::from_le_bytes(bytes.try_into().unwrap()) ^ 0x2222_2222_2222_2222;
-        let zero = w.wrapping_sub(0x0101_0101_0101_0101) & !w & 0x8080_8080_8080_8080;
-        if zero != 0 {
-            return i + zero.trailing_zeros() as usize / 8; // the lowest zero byte is exact
+    while i + 32 <= s.len() {
+        // SAFETY: AVX2 is enabled at build time (x86-64-v3), and the 32 bytes are inside `s`.
+        let quotes = unsafe {
+            let x = _mm256_loadu_si256(s.as_ptr().add(i) as *const __m256i);
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, _mm256_set1_epi8(b'"' as i8))) as u32
+        };
+        if quotes != 0 {
+            return i + quotes.trailing_zeros() as usize;
         }
-        i += 8;
+        i += 32;
     }
     i + s[i..].iter().position(|&b| b == b'"').unwrap()
 }
