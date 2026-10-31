@@ -377,27 +377,45 @@ fn main() {
             .collect();
         workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
-    let mut order: Vec<u32> = regions.concat();
-    drop(regions);
+    let mut order = Vec::with_capacity(n); // concat() would leave no room for the leftovers
+    regions.into_iter().for_each(|r| order.extend(r));
     for root in 0..n as u32 {
         grow(root, &mut order);
     }
-    let mut rank = vec![0u32; n];
-    for (new, &old) in order.iter().enumerate() {
-        rank[old as usize] = new as u32;
+    // 4. The CSR in breadth-first ids, the one the searches use. Each thread takes a contiguous
+    //    range of new ids: first it records their rank (old id -> new id) and degree sums, then it
+    //    copies their edges from the old CSR, renaming heads on the way.
+    let ranges: Vec<_> = (0..threads)
+        .map(|k| (n * k / threads, n * (k + 1) / threads))
+        .collect();
+    let rank: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let mut new_offsets = vec![0u32; n + 1];
+    std::thread::scope(|scope| {
+        let mut rest = &mut new_offsets[1..];
+        for &(first, last) in &ranges {
+            let (mine, tail) = rest.split_at_mut(last - first);
+            rest = tail;
+            let (order, offsets, rank) = (&order, &offsets, &rank);
+            scope.spawn(move || {
+                let mut sum = 0;
+                for (i, &old) in order[first..last].iter().enumerate() {
+                    rank[old as usize].store((first + i) as u32, Ordering::Relaxed);
+                    sum += offsets[old as usize + 1] - offsets[old as usize];
+                    mine[i] = sum;
+                }
+            });
+        }
+    });
+    let rank: Vec<u32> = rank.into_iter().map(AtomicU32::into_inner).collect();
+    let mut base = 0;
+    for &(first, last) in &ranges {
+        new_offsets[first + 1..=last].iter_mut().for_each(|o| *o += base);
+        base = new_offsets[last];
     }
-    // 4. The CSR in breadth-first ids, the one the searches use: each thread copies a contiguous
-    //    range of new ids from the old CSR, renaming heads on the way.
-    let new_offsets = prefix_sums(
-        order
-            .iter()
-            .map(|&old| offsets[old as usize + 1] - offsets[old as usize]),
-    );
     let mut new_edges = vec![0u32; m];
     std::thread::scope(|scope| {
         let mut rest = &mut new_edges[..];
-        for k in 0..threads {
-            let (first, last) = (n * k / threads, n * (k + 1) / threads);
+        for &(first, last) in &ranges {
             let (mine, tail) = rest.split_at_mut((new_offsets[last] - new_offsets[first]) as usize);
             rest = tail;
             let (order, offsets, edges, rank) = (&order[first..last], &offsets, &edges, &rank);
