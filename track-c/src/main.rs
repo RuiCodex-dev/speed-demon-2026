@@ -9,8 +9,6 @@
 //!    stays in cache, never the 200 MB input. Each record then sets the bit (country, id).
 //!    Nothing is stored per record.
 use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -31,23 +29,6 @@ fn map_file(path: &str) -> &'static [u8] {
     let ptr = unsafe { mmap(std::ptr::null_mut(), len, 1, 2, file.as_raw_fd(), 0) };
     assert!(ptr as isize != -1, "mmap failed");
     unsafe { std::slice::from_raw_parts(ptr, len) }
-}
-
-/// FxHash: one rotate, xor and multiply per 8 bytes.
-#[derive(Default)]
-struct Fx(u64);
-impl Hasher for Fx {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.0 =
-                (self.0.rotate_left(5) ^ u64::from_le_bytes(word)).wrapping_mul(0x517cc1b727220a95);
-        }
-    }
-    fn finish(&self) -> u64 {
-        self.0
-    }
 }
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
@@ -392,37 +373,29 @@ fn main() {
     let out_dir = args.get(2).map_or("/out", |s| s.as_str());
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
 
-    // regions.csv: plain `region_id,country` lines after a header, in one pass. Country codes get
-    // temporary ids in order of appearance, which are then renumbered in sorted order.
+    // regions.csv: plain `region_id,country` lines after a header, with codes [A-Z]{3} (spec 2.3).
+    // A code read as a base-26 number indexes a table that lists the codes in sorted order.
     let regions = map_file(&format!("{data_dir}/regions.csv"));
-    let mut seen_codes: HashMap<&[u8], u16, BuildHasherDefault<Fx>> = HashMap::default();
     let mut region_code: Vec<u16> = Vec::new();
-    for line in regions
-        .split(|&b| b == b'\n')
-        .skip(1)
-        .filter(|line| !line.is_empty())
-    {
-        let comma = line
-            .iter()
-            .position(|&b| b == b',')
-            .expect("bad regions.csv line");
-        let region = line[..comma]
-            .iter()
-            .fold(0, |acc, &b| acc * 10 + (b - b'0') as usize);
-        let next = seen_codes.len() as u16;
-        let code = *seen_codes.entry(&line[comma + 1..]).or_insert(next);
+    let mut present = [false; 26 * 26 * 26];
+    let mut p = regions.iter().position(|&b| b == b'\n').map_or(regions.len(), |i| i + 1);
+    while p < regions.len() {
+        let region = integer(regions, &mut p) as usize;
+        let code = (regions[p + 1..p + 4].iter()).fold(0, |acc, &b| acc * 26 + (b - b'A') as usize);
+        p += 5;
+        present[code] = true;
         if region >= region_code.len() {
             region_code.resize(region + 1, u16::MAX);
         }
-        region_code[region] = code;
+        region_code[region] = code as u16;
     }
-    let mut keys: Vec<&[u8]> = seen_codes.keys().copied().collect();
-    keys.sort_unstable();
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    let mut rank = [u16::MAX; 26 * 26 * 26];
+    for code in (0..rank.len()).filter(|&c| present[c]) {
+        rank[code] = keys.len() as u16;
+        keys.push([code / 676, code / 26 % 26, code % 26].map(|d| b'A' + d as u8).to_vec());
+    }
     let unmatched = keys.len() as u16;
-    let mut rank = vec![0u16; keys.len()];
-    for (sorted, key) in keys.iter().enumerate() {
-        rank[seen_codes[key] as usize] = sorted as u16;
-    }
     let country_of: Vec<u16> = (region_code.iter())
         .map(|&c| rank.get(c as usize).map_or(unmatched, |&r| r))
         .collect();
@@ -433,7 +406,7 @@ fn main() {
     } else {
         Vec::new()
     };
-    keys.push(b"_UNMATCHED"); // `_` sorts after every [A-Z] code, so it stays last
+    keys.push(b"_UNMATCHED".to_vec()); // `_` sorts after every [A-Z] code, so it stays last
 
     // records.csv: skip the BOM and the header, then cut the body into chunks.
     let data = map_file(&format!("{data_dir}/records.csv"));
