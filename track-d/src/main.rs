@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 unsafe extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 /// Maps a whole file read-only for the life of the process.
@@ -283,11 +284,14 @@ fn main() {
     let wbits = 32u32.saturating_sub((n.max(2) - 1).ilog2() + 1);
     let big = (1u32 << wbits) - 1;
 
-    // 1. One parse. Every thread files its edges into buckets by tail (`u >> SHIFT`, about 8k nodes
-    //    per bucket), in file order, and marks in-edges in its own bitset: only sequential writes
-    //    and a cache-sized bitset, instead of random atomics into node-sized arrays.
+    // 1. One parse. Every thread files its edges into buckets by tail (`u >> SHIFT`, about 32k
+    //    nodes per bucket), in file order, and marks in-edges in its own bitset: only sequential
+    //    writes and a cache-sized bitset, instead of random atomics into node-sized arrays.
+    //    A bucket is ~75 KB per thread; with the mmap threshold below that, each is its own
+    //    mapping, so the CSR build can hand its memory back as soon as the bucket is placed.
+    unsafe { mallopt(-3, 64 << 10) }; // M_MMAP_THRESHOLD
     //    has_in[v]: v has an in-edge from another node, so a path from some s != v can end at v.
-    const SHIFT: usize = 13;
+    const SHIFT: usize = 15;
     let buckets = (n >> SHIFT) + 1;
     let parsed: Vec<(Vec<Vec<(u32, u32)>>, Vec<u64>, Vec<(u64, u64)>)> =
         std::thread::scope(|scope| {
@@ -339,6 +343,11 @@ fn main() {
         bucket_start[buckets] as usize, m,
         "edge count differs from the header"
     );
+    // The lists by bucket, so each CSR thread owns (and frees) the ones it places.
+    let mut by_bucket: Vec<Vec<Vec<(u32, u32)>>> = (0..buckets).map(|_| Vec::new()).collect();
+    for (lists, _, _) in parsed {
+        lists.into_iter().zip(&mut by_bucket).for_each(|(list, b)| b.push(list));
+    }
     let mut offsets = vec![m as u32; n + 1];
     let mut edges = vec![0u32; m];
     std::thread::scope(|scope| {
@@ -351,13 +360,14 @@ fn main() {
             let (my_edges, rest) =
                 edges_rest.split_at_mut((bucket_start[last] - bucket_start[first]) as usize);
             edges_rest = rest;
-            let (parsed, bucket_start) = (&parsed, &bucket_start);
+            let (mine, bucket_start): (Vec<_>, _) =
+                (by_bucket.drain(..last - first).collect(), &bucket_start);
             scope.spawn(move || {
-                for b in first..last {
+                for (b, lists) in (first..last).zip(mine) {
                     let base = b << SHIFT;
                     let span = ((b + 1) << SHIFT).min(n) - base.min(n);
                     let mut cursor = vec![0u32; span + 1];
-                    for list in parsed.iter().map(|p| &p.0[b]) {
+                    for list in &lists {
                         for &(u, _) in list {
                             cursor[u as usize - base + 1] += 1;
                         }
@@ -373,7 +383,7 @@ fn main() {
                         my_offsets[local + i] = start + cursor[i];
                     }
                     let edge_base = (start - bucket_start[first]) as usize;
-                    for list in parsed.iter().map(|p| &p.0[b]) {
+                    for list in &lists {
                         for &(u, e) in list {
                             let slot = &mut cursor[u as usize - base];
                             my_edges[edge_base + *slot as usize] = e;
@@ -384,7 +394,6 @@ fn main() {
             });
         }
     });
-    drop(parsed);
 
     // Every thread grows a breadth-first region from its own seed and claims nodes with an atomic
     // flag, so each region gets contiguous new ids. Nodes no seed reaches (islands, isolated nodes)
@@ -432,40 +441,38 @@ fn main() {
         grow(root, &mut order);
     }
     // 4. The CSR in breadth-first ids, the one the searches use. Each thread takes a contiguous
-    //    range of new ids: first it records their rank (old id -> new id) and degree sums, then it
-    //    copies their edges from the old CSR, renaming heads on the way.
+    //    range of new ids: it records their rank (old id -> new id) and degree sum, then copies
+    //    their edges from the old CSR, renaming heads on the way. The new offsets are only filled
+    //    in once the old edges are freed, so the two edge arrays never meet a third array.
     let ranges: Vec<_> = (0..threads)
         .map(|k| (n * k / threads, n * (k + 1) / threads))
         .collect();
+    let degree = |old: u32| offsets[old as usize + 1] - offsets[old as usize];
     let rank: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
-    let mut new_offsets = vec![0u32; n + 1];
-    std::thread::scope(|scope| {
-        let mut rest = &mut new_offsets[1..];
-        for &(first, last) in &ranges {
-            let (mine, tail) = rest.split_at_mut(last - first);
-            rest = tail;
-            let (order, offsets, rank) = (&order, &offsets, &rank);
-            scope.spawn(move || {
-                let mut sum = 0;
-                for (i, &old) in order[first..last].iter().enumerate() {
-                    rank[old as usize].store((first + i) as u32, Ordering::Relaxed);
-                    sum += offsets[old as usize + 1] - offsets[old as usize];
-                    mine[i] = sum;
-                }
-            });
-        }
+    let sums: Vec<u32> = std::thread::scope(|scope| {
+        let workers: Vec<_> = ranges
+            .iter()
+            .map(|&(first, last)| {
+                let (order, rank) = (&order, &rank);
+                scope.spawn(move || {
+                    let mut sum = 0;
+                    for (i, &old) in order[first..last].iter().enumerate() {
+                        rank[old as usize].store((first + i) as u32, Ordering::Relaxed);
+                        sum += degree(old);
+                    }
+                    sum
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).collect()
     });
     let rank: Vec<u32> = rank.into_iter().map(AtomicU32::into_inner).collect();
-    let mut base = 0;
-    for &(first, last) in &ranges {
-        new_offsets[first + 1..=last].iter_mut().for_each(|o| *o += base);
-        base = new_offsets[last];
-    }
+    drop(claimed);
     let mut new_edges = vec![0u32; m];
     std::thread::scope(|scope| {
         let mut rest = &mut new_edges[..];
-        for &(first, last) in &ranges {
-            let (mine, tail) = rest.split_at_mut((new_offsets[last] - new_offsets[first]) as usize);
+        for (&(first, last), &sum) in ranges.iter().zip(&sums) {
+            let (mine, tail) = rest.split_at_mut(sum as usize);
             rest = tail;
             let (order, offsets, edges, rank) = (&order[first..last], &offsets, &edges, &rank);
             scope.spawn(move || {
@@ -480,7 +487,25 @@ fn main() {
             });
         }
     });
-    drop((order, edges));
+    drop(edges);
+    let mut new_offsets = vec![0u32; n + 1];
+    std::thread::scope(|scope| {
+        let (mut rest, mut base) = (&mut new_offsets[1..], 0);
+        for (&(first, last), &sum) in ranges.iter().zip(&sums) {
+            let (mine, tail) = rest.split_at_mut(last - first);
+            rest = tail;
+            let order = &order[first..last];
+            scope.spawn(move || {
+                let mut at = base;
+                for (o, &old) in mine.iter_mut().zip(order) {
+                    at += degree(old);
+                    *o = at;
+                }
+            });
+            base += sum;
+        }
+    });
+    drop((order, offsets));
     let rename =
         |key: u64| (rank[(key >> 32) as usize] as u64) << 32 | rank[key as u32 as usize] as u64;
     let graph = Graph {
@@ -492,19 +517,21 @@ fn main() {
     };
 
     // Queries, answered in parallel; answers land in their input order.
+    // Each is kept as (s, t) in new ids, or None when t cannot be reached from s without a search:
+    // has_in[t] says whether a path from some s != t can end at t.
     let mut list = Vec::new();
     let mut p = 0;
     while p < queries.len() {
-        list.push((
-            number(queries, &mut p) as u32,
-            number(queries, &mut p) as u32,
-        ));
+        let (s, t) = (number(queries, &mut p), number(queries, &mut p));
+        let reachable = s == t || has_in[t as usize / 64] >> (t % 64) & 1 == 1;
+        list.push(reachable.then(|| (rank[s as usize], rank[t as usize])));
     }
     let answers: Vec<AtomicU64> = (0..list.len()).map(|_| AtomicU64::new(u64::MAX)).collect();
     // Queries are taken in order of their source's new id, so the threads search neighbouring
     // regions at the same time and share the graph in the last-level cache.
     let mut by_source: Vec<usize> = (0..list.len()).collect();
-    by_source.sort_unstable_by_key(|&i| rank[list[i].0 as usize]);
+    by_source.sort_unstable_by_key(|&i| list[i].map(|q| q.0));
+    drop((rank, has_in));
     let next = AtomicU32::new(0);
     std::thread::scope(|scope| {
         for _ in 0..threads.min(list.len()) {
@@ -517,12 +544,7 @@ fn main() {
                     else {
                         break;
                     };
-                    let (s, t) = list[i];
-                    let reachable = s == t || has_in[t as usize / 64] >> (t % 64) & 1 == 1;
-                    if !reachable {
-                        continue;
-                    }
-                    let query = (rank[s as usize], rank[t as usize]);
+                    let Some(query) = list[i] else { continue };
                     let answer = shortest(&graph, query, &mut dist, &mut heap).or_else(|_| {
                         let (dist, heap) =
                             wide.get_or_insert_with(|| (Dist::new(n), Queue::new()));
