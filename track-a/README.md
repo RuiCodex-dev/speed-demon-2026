@@ -9,19 +9,20 @@ Rust, standard library only.
 1. **Read nothing twice.** `requests.log` is memory-mapped, never copied: the scoring harness pre-warms it
    into the page cache, so the mapping costs no memory of our own. It is cut into one chunk per thread at
    line boundaries.
-2. **Parse by position.** A timestamp is always 27 bytes, so the hour is the first 13 bytes; it is
-   recomputed with integer calendar arithmetic (no date library) only when that prefix changes, which is
-   rare because each shard writes in time order. Spaces are found 8 bytes at a time with the classic
-   zero-byte test. Endpoints are interned in a small per-thread open-addressing table that hashes and
-   compares them 8 bytes at a time with masked loads, so there are no `memcpy`/`memcmp` calls per line.
-   Each line becomes one packed `u64`: hour, endpoint id, 5xx flag, latency.
-3. **Group without copying.** The per-thread endpoint tables are merged into one byte-sorted list, so the
-   group id `(hour - first hour) * endpoints + endpoint rank` is already the output order. Each thread
-   rewrites its records in place as `group << 33 | 5xx << 32 | latency` and sorts them, so every group is
-   one run per chunk and no second per-line array exists.
-4. **Percentiles without full sorts.** Output ranges of groups are formatted in parallel: a group's runs are
-   gathered from the 12 sorted chunks and the three nearest-rank percentiles come from
-   `select_nth_unstable` on shrinking prefixes.
+2. **Parse by position.** A timestamp is always 27 bytes, so the hour is the first 13 bytes, compared
+   as two 8-byte words and recomputed with integer calendar arithmetic (no date library) only when it
+   changes. Spaces are found 32 bytes at a time (AVX2). Endpoints are interned in a small per-thread
+   open-addressing table, hashed from their first and last 8 bytes and compared 32 bytes at a time with
+   masked loads that never read past the line. The latency is read 8 bytes at a time (SWAR). Each line
+   becomes one packed `u64`: hour, endpoint id, 5xx flag, latency.
+3. **Little memory in any phase.** Each thread parses its chunk in 4 MB pieces; a piece's records are
+   sorted by (hour, endpoint) and reduced to 4-byte latencies plus one run per group before the next
+   piece is read. After the per-thread endpoint tables are merged into one byte-sorted list, every run
+   gets its group id `(hour - first hour) * endpoints + endpoint rank`, which is already the output order.
+4. **Percentiles without full sorts.** Ranges of groups are summarised in parallel: a group's runs are
+   gathered from every piece and the three nearest-rank percentiles come from `select_nth_unstable` on
+   shrinking prefixes. The latencies are freed before any output text exists, because the output's page
+   cache counts as memory.
 
 Every step and its measured effect, including what did not work, is in [PERF.md](PERF.md).
 
@@ -31,7 +32,7 @@ None.
 
 ## With another 24 hours
 
-- The sort is still about a fifth of the time; a radix partition on the hour while parsing (records are
-  nearly in time order per shard) could replace most of it without a second buffer.
-- Memory is now the per-line records (8 bytes each): storing latencies as 4 bytes in per-hour runs would
-  halve it.
+- Parsing is now bound on reading the input: profile the per-line work again (the endpoint table is
+  still about a third of it) and try a layout of the table that needs one cache line per lookup.
+- The output (10 MB) is written by one thread at the end; overlapping it with the formatting would
+  remove most of that time.

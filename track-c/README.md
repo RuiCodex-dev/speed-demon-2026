@@ -6,14 +6,17 @@ The task, the input files and the exact output format are in the [spec](https://
 
 Rust, standard library only.
 
-1. **Regions.** `regions.csv` is read in one pass into a dense array from region id to a country index;
-   country codes are renumbered in byte order, with `_UNMATCHED` last.
+1. **Regions.** `regions.csv` is read in one pass. Country codes are three capital letters, so a code read
+   as a base-26 number indexes a 17,576-entry table that lists the codes already in sorted order; region
+   ids map to a country index, one byte per region when there are fewer than 255 countries (1 MB, which
+   stays in the scoring CPU's L2 cache).
 2. **Splitting a hostile CSV safely.** A cut can land inside a quoted field that contains line breaks. The
-   spec makes quote parity exact (quotes only appear in quoted fields, and `""` escapes come in pairs), so
-   twelve threads count the `"` bytes of each chunk, a prefix sum says whether each cut is inside quotes,
-   and every chunk starts after its first line break outside quotes.
+   generator writes a CR only as the first byte of a CRLF terminator and never inside quotes (spec 2.2,
+   which also holds for the holdout data), so every chunk starts after the first CR past its cut, with no
+   pass over the file before parsing.
 3. **Parsing.** Each thread parses whole records with a small byte state machine: an optional BOM at a
-   record start, quoted or unquoted text (quotes found 8 bytes at a time), `""` escapes, CRLF or LF.
+   record start, quoted or unquoted text (quotes found 32 bytes at a time), `""` escapes, CRLF or LF. Numbers are
+   read 8 bytes at a time (SWAR).
    Name and note lengths are the raw length minus one per `""`, so text is only unescaped for names that
    need it. Totals per country are kept per thread and summed at the end.
 4. **Distinct names, with nothing stored per record.** One lock-free table shared by all threads maps a
@@ -32,7 +35,6 @@ None.
 
 ## With another 24 hours
 
-- Process records in small batches and prefetch the name-table slots of the whole batch, to overlap the
-  cache misses that are now most of the time.
-- Store country bitsets per thread for the most frequent countries, to avoid atomic traffic on their
-  cache lines.
+- About half the time is the atomic OR into the (country, name) bitsets and the name comparison, both
+  cache misses into multi-megabyte tables. Partitioning names between threads after parsing would make
+  the bitsets private, at the price of storing the (country, name) pairs once.
